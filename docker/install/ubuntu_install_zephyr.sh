@@ -21,32 +21,50 @@ set -u
 set -o pipefail
 set -x
 
-export DEBIAN_FRONTEND=noninteractive
-export TZ=Etc/UTC
-sudo ln -snf /usr/share/zoneinfo/$TZ /etc/localtime
-echo $TZ > /etc/timezone
-
-sudo apt-get install -y --no-install-recommends \
+sudo apt-install-and-clear -y --no-install-recommends \
      libsdl2-dev ca-certificates gnupg software-properties-common wget \
-     git cmake ninja-build gperf \
+     git ninja-build gperf \
      ccache dfu-util device-tree-compiler wget \
      python3-dev python3-pip python3-setuptools python3-tk python3-wheel python3-venv \
-     xz-utils file make gcc gcc-multilib g++-multilib apt-transport-https
+     xz-utils file make gcc gcc-multilib g++-multilib apt-transport-https libudev-dev \
+     libmagic1
 
 wget --no-verbose https://apt.kitware.com/keys/kitware-archive-latest.asc
 sudo apt-key add kitware-archive-latest.asc
 
-sudo apt-add-repository 'deb https://apt.kitware.com/ubuntu/ bionic main'
+echo deb https://apt.kitware.com/ubuntu/ jammy main\
+     >> /etc/apt/sources.list.d/kitware.list
 sudo apt-get update
 
-sudo apt-get install -y cmake
+sudo apt-install-and-clear -y cmake
 
-pip3 install west
+# Find release version
+apt-get update
+apt-install-and-clear -y \
+    lsb-core
+
+release=$(lsb_release -sc)
+if [ "${release}" == "bionic" ]; then
+     python_cmd="python3"
+elif [ "${release}" == "focal" ]; then
+     python_cmd="python3.8"
+elif [ "${release}" == "jammy" ]; then
+     python_cmd="python3.8"
+else
+    echo "Don't know which version of python to use for Zephyr."
+    exit 2
+fi
+
+# Current Zephyr version is compatible with python3.8.
+# We use a different python env for Zephyr to test the
+# real world scenario where TVM and Zephyr could be in different
+# python environments.
+# TODO: use virtual env for Zephyr.
+$python_cmd -m pip install west
 
 # Init ZephyrProject
 ZEPHYR_PROJECT_PATH=/opt/zephyrproject
-ZEPHYR_INIT_SCRIPT=$(find -name "ubuntu_init_zephyr_project.sh")
-bash ${ZEPHYR_INIT_SCRIPT} ${ZEPHYR_PROJECT_PATH} v2.5-branch
+bash /install/ubuntu_init_zephyr_project.sh ${ZEPHYR_PROJECT_PATH}
 cd ${ZEPHYR_PROJECT_PATH}
 
 # As part of the build process, Zephyr needs to touch some symlinks in zephyr/misc/generated/syscalls_links (this path is relative to the
@@ -62,12 +80,4 @@ chmod -R o+w ${ZEPHYR_PROJECT_PATH}
 mkdir zephyr/.cache
 chmod o+rwx zephyr/.cache
 
-#/opt/west/bin/pip3 install -r /opt/zephyrproject/zephyr/scripts/requirements.txt
-pip3 install -r /opt/zephyrproject/zephyr/scripts/requirements.txt
-
-ZEPHYR_SDK_VERSION=0.12.3
-ZEPHYR_SDK_FILE=zephyr-sdk-linux-setup.run
-wget --no-verbose -O $ZEPHYR_SDK_FILE \
-    https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZEPHYR_SDK_VERSION}/zephyr-sdk-${ZEPHYR_SDK_VERSION}-x86_64-linux-setup.run
-chmod +x $ZEPHYR_SDK_FILE
-"./$ZEPHYR_SDK_FILE" -- -d /opt/zephyr-sdk
+$python_cmd -m pip install -r /opt/zephyrproject/zephyr/scripts/requirements.txt

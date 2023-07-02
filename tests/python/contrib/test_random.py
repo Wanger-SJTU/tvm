@@ -20,6 +20,7 @@ import numpy as np
 from tvm.contrib import random
 from tvm import rpc
 import tvm.testing
+import threading
 
 
 def test_randint():
@@ -120,17 +121,20 @@ def test_random_fill():
             return
 
         np_ones = np.ones((512, 512), dtype=dtype)
-        server = rpc.Server("127.0.0.1")
-        remote = rpc.connect(server.host, server.port)
-        value = tvm.nd.empty((512, 512), dtype, remote.cpu())
-        random_fill = remote.get_function("tvm.contrib.random.random_fill")
-        random_fill(value)
 
-        assert np.count_nonzero(value.numpy()) == 512 * 512
+        def check_remote(server):
+            remote = rpc.connect(server.host, server.port)
+            value = tvm.nd.empty((512, 512), dtype, remote.cpu())
+            random_fill = remote.get_function("tvm.contrib.random.random_fill")
+            random_fill(value)
 
-        # make sure arithmentic doesn't overflow too
-        np_values = value.numpy()
-        assert np.isfinite(np_values * np_values + np_values).any()
+            assert np.count_nonzero(value.numpy()) == 512 * 512
+
+            # make sure arithmentic doesn't overflow too
+            np_values = value.numpy()
+            assert np.isfinite(np_values * np_values + np_values).any()
+
+        check_remote(rpc.Server("127.0.0.1"))
 
     for dtype in [
         "bool",
@@ -152,8 +156,35 @@ def test_random_fill():
         test_rpc(dtype)
 
 
+def test_random_fill_mt():
+    """Check random filler applicability in case of nontrivial thread pool configuration.
+    Particularly when MaxConcurrency != num_workers_used_ which is actual for big-little systems.
+    """
+    no_exception_happened = True
+
+    def test_body():
+        try:
+            num_thread_used = 1
+            configure_threads = tvm.get_global_func("runtime.config_threadpool")
+            configure_threads(1, num_thread_used)
+
+            test_input = tvm.runtime.ndarray.empty((10, 10))
+            random_fill = tvm.get_global_func("tvm.contrib.random.random_fill_for_measure")
+            random_fill(test_input)
+        except:
+            nonlocal no_exception_happened
+            no_exception_happened = False
+
+    # ThreadPool object is thread local. To eliminate effect on other test cases put it into thread
+    x = threading.Thread(target=test_body)
+    x.start()
+    x.join()
+    assert no_exception_happened
+
+
 if __name__ == "__main__":
     test_randint()
     test_uniform()
     test_normal()
     test_random_fill()
+    test_random_fill_mt()

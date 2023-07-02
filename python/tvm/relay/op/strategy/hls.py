@@ -80,7 +80,7 @@ def log_softmax_strategy_hls(attrs, inputs, out_type, target):
     return strategy
 
 
-@override_native_generic_func("conv2d_strategy")
+@conv2d_strategy.register("hls")
 def conv2d_strategy_hls(attrs, inputs, out_type, target):
     """conv2d hls strategy"""
     strategy = _op.OpStrategy()
@@ -109,7 +109,7 @@ def conv2d_strategy_hls(attrs, inputs, out_type, target):
                 name="conv2d_nhwc.hls",
             )
         else:
-            raise RuntimeError("Unsupported conv2d layout {}".format(layout))
+            raise RuntimeError(f"Unsupported conv2d layout {layout}")
     elif is_depthwise_conv2d(data.shape, layout, kernel.shape, kernel_layout, groups):
         if layout == "NCHW":
             assert kernel_layout == "OIHW"
@@ -126,18 +126,18 @@ def conv2d_strategy_hls(attrs, inputs, out_type, target):
                 name="depthwise_nhwc.hls",
             )
         else:
-            raise RuntimeError("Unsupported depthwise_conv2d layout {}".format(layout))
+            raise RuntimeError(f"Unsupported depthwise_conv2d layout {layout}")
     else:  # group_conv2d
         raise RuntimeError("group_conv2d is not supported for hls")
     return strategy
 
 
-@override_native_generic_func("conv2d_NCHWc_strategy")
+@conv2d_NCHWc_strategy.register("hls")
 def conv2d_NCHWc_strategy_hls(attrs, inputs, out_type, target):
     """conv2d_NCHWc hls strategy"""
     strategy = _op.OpStrategy()
     strategy.add_implementation(
-        wrap_compute_conv2d(topi.nn.conv2d_NCHWc, True, True),
+        wrap_compute_conv2d(topi.nn.conv2d_NCHWc, need_data_layout=True, need_out_layout=True),
         wrap_topi_schedule(topi.hls.schedule_conv2d_NCHWc),
         name="conv2d_NCHWc.hls",
     )
@@ -192,5 +192,5 @@ def bitserial_conv2d_strategy_hls(attrs, inputs, out_type, target):
             name="bitserial_conv2d_nhwc.hls",
         )
     else:
-        raise ValueError("Data layout {} not supported.".format(layout))
+        raise ValueError(f"Data layout {layout} not supported.")
     return strategy

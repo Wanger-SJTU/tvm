@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,8 +16,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -e
-set -u
+set -euxo pipefail
+
 source tests/scripts/setup-pytest-env.sh
 
 
@@ -27,8 +27,7 @@ source tests/scripts/setup-pytest-env.sh
 find . -type f -path "*.pyc" | xargs rm -f
 make cython3
 
-# Note: Default behaviour is to assume the test target is Ethos-N77
-# but setting ETHOSN_VARIANT_CONFIG appropriately
-# (e.g. ETHOSN_VARIANT_CONFIG=ETHOSN78_1TOPS_4PLE_448KSRAM)
-# switches the target to an Ethos-N78 configuration.
+# Note: Setting ETHOSN_TEST_TARGET_CONFIG appropriately
+# (e.g. ETHOSN_TEST_TARGET_CONFIG="ethos-n -variant=n78 -tops=1 -ple_ratio=2")
+# switches the target to various NPU configurations.
 run_pytest ctypes python-ethosn tests/python/contrib/test_ethosn

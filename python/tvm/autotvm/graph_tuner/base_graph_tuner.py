@@ -49,7 +49,7 @@ def get_infer_layout(task_name):
         return topi.nn.conv2d_infer_layout
     if task_name.startswith("depthwise_conv2d"):
         return topi.nn.depthwise_conv2d_infer_layout
-    raise ValueError("Cannot find infer layout for task %s" % task_name)
+    raise ValueError(f"Cannot find infer layout for task {task_name}")
 
 
 @autotvm.template("layout_transform")
@@ -166,16 +166,16 @@ class BaseGraphTuner(object):
         if isinstance(graph, relay.function.Function):
             node_dict = {}
             graph = bind_inputs(graph, input_shapes, dtype)
-            expr2graph(graph, self._target_ops, node_dict, self._node_list)
+            expr2graph(graph, self._target_ops, node_dict, self._node_list, target)
         else:
-            raise RuntimeError("Unsupported graph type: %s" % str(type(graph)))
+            raise RuntimeError(f"Unsupported graph type: {type(graph)}")
 
         self._graph = graph
         self._in_nodes_dict = get_in_nodes(self._node_list, self._target_ops, input_shapes.keys())
         if len(self._in_nodes_dict) == 0:
             raise RuntimeError(
-                "Could not find any input nodes with whose "
-                "operator is one of %s" % self._target_ops
+                f"Could not find any input nodes with whose "
+                f"operator is one of {self._target_ops}"
             )
         self._out_nodes_dict = get_out_nodes(self._in_nodes_dict)
         self._fetch_cfg()
@@ -375,6 +375,7 @@ class BaseGraphTuner(object):
         layout_records=None,
         target_host=None,
         infer_layout=False,
+        runner=None,
     ):
         """Benchmark all possible layout transformation in the graph,
         given a set of schedule candidates for each workload of target operator.
@@ -438,9 +439,11 @@ class BaseGraphTuner(object):
             of benchmarking on target device.
 
             This might bring performance loss comparing to benchmarking layout transformation.
+        runner : Runner, optional
+            Accept a user-supplied runner
         """
         self._logger.info("Start to benchmark layout transformation...")
-        self._target, target_host = Target.check_and_update_host_consist(self._target, target_host)
+        self._target, target_host = Target.canon_target_and_host(self._target, target_host)
 
         if layout_records is None and infer_layout:
             raise RuntimeError("Requires some records to infer layout transformation time.")
@@ -483,7 +486,6 @@ class BaseGraphTuner(object):
             return _callback
 
         builder = autotvm.LocalBuilder(n_parallel=n_parallel, build_func=build_func)
-        runner = autotvm.LocalRunner(number=min_exec_num, repeat=1, timeout=timeout)
         if use_rpc:
             if device_key is None:
                 raise RuntimeError("device_key need to be set to use rpc tracker mode.")
@@ -496,6 +498,8 @@ class BaseGraphTuner(object):
                 repeat=1,
                 timeout=timeout,
             )
+        elif not runner:
+            runner = autotvm.LocalRunner(number=min_exec_num, repeat=1, timeout=timeout)
         measure_option = autotvm.measure_option(builder=builder, runner=runner)
         for args in args_list:
             data, in_layout, out_layout = args
@@ -579,7 +583,7 @@ class BaseGraphTuner(object):
             records = self.get_optimal_records()
             for record in records:
                 out_file.write(encode(record[0], record[1]) + "\n")
-        msg = "Writing optimal schedules to %s successfully." % record_file
+        msg = f"Writing optimal schedules to {record_file} successfully."
         self._logger.info(msg)
 
     @abstractmethod

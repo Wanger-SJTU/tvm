@@ -60,7 +60,9 @@ class Tensor(DataProducer, _expr.ExprOp):
     def __call__(self, *indices):
         ndim = self.ndim
         if len(indices) != ndim:
-            raise ValueError("Need to provide %d index in tensor slice" % ndim)
+            raise ValueError(
+                f"Need to provide {ndim} index in tensor but {len(indices)} was provided"
+            )
         indices = convert_to_object(indices)
         args = []
         for x in indices:
@@ -122,7 +124,7 @@ class Tensor(DataProducer, _expr.ExprOp):
         op = self.op
         if op.num_outputs == 1:
             return op.name
-        return "%s.v%d" % (op.name, self.value_index)
+        return f"{op.name}.v{self.value_index}"
 
 
 class Operation(Object):

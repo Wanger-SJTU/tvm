@@ -22,19 +22,20 @@ Integrate auto_scheduler into relay. It implements the following items:
 2. Provide auto-scheduling for all TOPI compute functions
 """
 
+import json
 import logging
 import threading
-from copy import deepcopy
+import traceback
 
 import tvm
 from tvm import autotvm, transform
+from tvm._ffi.base import TVMError
 from tvm.ir.transform import PassContext
 from tvm.runtime import convert_to_object
-
+from tvm.target import Target
 from tvm.te.tensor import ComputeOp, PlaceholderOp, Tensor
 from tvm.tir import Reduce
 from tvm.tir import expr as _expr
-from tvm.target import Target
 
 from . import _ffi_api
 from .compute_dag import ComputeDAG, LayoutRewriteOption
@@ -46,11 +47,10 @@ from .workload_registry import register_workload_tensors
 logger = logging.getLogger("auto_scheduler")
 
 
-def call_all_topi_funcs(mod, params, target, opt_level=3):
+def call_all_topi_funcs(mod, params, target, error_list, opt_level=3):
     """Call all TOPI compute to extract auto_scheduler tasks in a Relay program"""
     # pylint: disable=import-outside-toplevel
     from tvm import relay
-    from tvm.relay.backend import graph_executor_codegen
 
     # Turn off AutoTVM config not found warnings
     old_autotvm_silent = autotvm.GLOBAL_SCOPE.silent
@@ -60,34 +60,19 @@ def call_all_topi_funcs(mod, params, target, opt_level=3):
         opt_level=opt_level,
         config={
             "relay.backend.use_auto_scheduler": True,
-            "relay.backend.disable_compile_engine_cache": True,
         },
         disabled_pass={"AutoSchedulerLayoutRewrite"},
     ):
+        compiler = relay.vm.VMCompiler()
+        if params:
+            compiler.set_params(params)
+        mod = tvm.IRModule.from_expr(mod) if isinstance(mod, relay.Function) else mod
         try:
-            # TODO(jwfromm) Remove this once AlterOpLayout bug that mutates
-            # source module is fixed. Until then, create a clone.
-            mod_clone = deepcopy(mod)
-            opt_mod, _ = relay.optimize(mod_clone, target, params)
-            grc = graph_executor_codegen.GraphExecutorCodegen(None, target)
-            grc.codegen(opt_mod["main"])
-        except tvm.TVMError:
-            print(
-                "Get errors with GraphExecutorCodegen for task extraction. "
-                "Fallback to VMCompiler."
-            )
-            mod_clone = deepcopy(mod)
-            compiler = relay.vm.VMCompiler()
-            if params:
-                compiler.set_params(params)
-            mod_clone = (
-                tvm.IRModule.from_expr(mod_clone)
-                if isinstance(mod_clone, relay.Function)
-                else mod_clone
-            )
-            compiler.lower(mod_clone, target)
-
-    autotvm.GLOBAL_SCOPE.silent = old_autotvm_silent
+            compiler.lower(mod, target)
+        except TVMError:
+            error_list.append(f"{traceback.format_exc()}")
+        finally:
+            autotvm.GLOBAL_SCOPE.silent = old_autotvm_silent
 
 
 def extract_tasks(
@@ -97,7 +82,9 @@ def extract_tasks(
     target_host=None,
     hardware_params=None,
     include_simple_tasks=False,
+    dump_workload_to_dag_log=None,
     opt_level=3,
+    other_targets=None,
 ):
     """Extract tuning tasks from a relay program.
 
@@ -115,8 +102,12 @@ def extract_tasks(
         Hardware parameters used for the search tasks
     include_simple_tasks: bool
         Whether to extract simple tasks that do not include complicated ops.
+    dump_workload_to_dag_log: Optional[str]
+        A file to dump an association between the workload keys and the actual DAG
     opt_level : Optional[int]
         The optimization level of the task extractions.
+    other_targets: Optional[List[tvm.target.Target]]
+        Other targets for call_all_topi_funcs, e.g., cutlass target.
 
     Returns
     -------
@@ -126,8 +117,7 @@ def extract_tasks(
         The weight (i.e. the number of appearance) of extracted tasks
     """
     # pylint: disable=import-outside-toplevel
-
-    target, target_host = Target.check_and_update_host_consist(target, target_host)
+    target, target_host = Target.canon_target_and_host(target, target_host)
 
     # Run the compiler to collect all TOPI calls during compilation.
     env = TracingEnvironment(
@@ -137,14 +127,24 @@ def extract_tasks(
     dispatch_ctx = DispatchContext.current
     old_verbose = dispatch_ctx.verbose
     dispatch_ctx.verbose = 0
+
+    targets = [target]
+    if other_targets is not None:
+        targets += other_targets
+    errors = []
     with env:
         # Wrap build call in a new thread to avoid the conflict
         # between python's multiprocessing and tvm's thread pool
         build_thread = threading.Thread(
-            target=call_all_topi_funcs, args=(mod, params, target, opt_level)
+            target=call_all_topi_funcs, args=(mod, params, targets, errors, opt_level)
         )
         build_thread.start()
         build_thread.join()
+
+    if errors:
+        error_strings = ["Task extraction had the following errors:"] + errors
+        raise TVMError("\n".join(error_strings))
+
     dispatch_ctx.verbose = old_verbose
 
     # create search tasks
@@ -168,7 +168,11 @@ def extract_tasks(
                 desc=",".join(func_names),
             )
         )
-        weights.append(weight)
+        weights.append(int(weight))
+
+    if dump_workload_to_dag_log is not None:
+        with open(dump_workload_to_dag_log, "w") as f:
+            json.dump({task.workload_key: str(task.compute_dag) for task in tasks}, f)
 
     return tasks, weights
 
@@ -177,7 +181,8 @@ class TracingMode:
     """Two modes for tracing"""
 
     EXTRACT_TASK = 0  # trace all topi calls to extract tasks
-    EXTRACT_COMPLEX_TASK_ONLY = 1  # same as EXTRACT_TASK but ignore the task without complex ops
+    # same as EXTRACT_TASK but ignore the task without complex ops
+    EXTRACT_COMPLEX_TASK_ONLY = 1
     PREPARE_LAYOUT_REWRITE = 2  # trace topi calls to prepare layout rewrite
 
 
@@ -323,9 +328,9 @@ def auto_schedule_topi(func_name, outs):
     """
 
     # pylint: disable=import-outside-toplevel
-    from tvm.auto_scheduler.measure import (
+    from tvm.auto_scheduler.measure import (  # lazily import to avoid recursive dependency
         prepare_input_map,
-    )  # lazily import to avoid recursive dependency
+    )
 
     io_tensors, has_layout_free, has_complex_op = traverse_to_get_io_tensors(outs)
     if not io_tensors:  # The compute includes dynamic shapes which are not supported yet.
@@ -337,7 +342,8 @@ def auto_schedule_topi(func_name, outs):
         logger.info("Failed to create a ComputeDAG for auto_scheduler: %s", str(err))
         return None
 
-    key = register_workload_tensors(dag.workload_key(), io_tensors)
+    workload_key = dag.workload_key()
+    key = register_workload_tensors(workload_key, io_tensors)
     target = tvm.target.Target.current()
 
     dispatch_ctx = DispatchContext.current
@@ -357,7 +363,7 @@ def auto_schedule_topi(func_name, outs):
         # in the task extraction mode
         if has_complex_op or env.tracing_mode == TracingMode.EXTRACT_TASK:
             env.add_workload_key(func_name, key)
-            input_map = prepare_input_map(io_tensors)
+            input_map = prepare_input_map(io_tensors, workload_key)
             if input_map:
                 env.add_workload_input_names(key, list(input_map.values()))
     elif env.tracing_mode == TracingMode.PREPARE_LAYOUT_REWRITE:
@@ -468,6 +474,11 @@ def rewrite_compute_body(compute_tensor, new_layout):
     return outputs[0] if num == 1 else outputs
 
 
+def rewrite_tensor_shape(tensor, shape):
+    """Rewrite the tensor shape"""
+    _ffi_api.RewriteTensorShape(tensor, shape)
+
+
 def is_auto_scheduler_enabled():
     """Return whether the auto-scheduler is enabled.
 
@@ -476,4 +487,7 @@ def is_auto_scheduler_enabled():
     enabled: bool
         Whether the auto-scheduler is enabled
     """
-    return PassContext.current().config.get("relay.backend.use_auto_scheduler", False)
+    return PassContext.current().config.get(
+        "relay.backend.use_auto_scheduler",
+        False,
+    )

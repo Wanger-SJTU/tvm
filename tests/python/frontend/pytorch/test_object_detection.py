@@ -19,6 +19,9 @@
 import numpy as np
 import cv2
 
+import torch
+import torchvision
+
 import tvm
 
 import tvm.testing
@@ -30,9 +33,6 @@ from tvm.relay.frontend.pytorch_utils import (
     rewrite_scatter_to_gather,
 )
 from tvm.contrib.download import download
-
-import torch
-import torchvision
 
 in_size = 300
 
@@ -94,8 +94,7 @@ def generate_jit_model(index):
 def test_detection_models():
     img = "test_street_small.jpg"
     img_url = (
-        "https://raw.githubusercontent.com/dmlc/web-data/"
-        "master/gluoncv/detection/street_small.jpg"
+        "https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/detection/street_small.jpg"
     )
     download(img_url, img)
 
@@ -105,7 +104,11 @@ def test_detection_models():
     shape_list = [(input_name, input_shape)]
 
     scripted_model = generate_jit_model(1)
-    mod, params = relay.frontend.from_pytorch(scripted_model, shape_list)
+    with tvm.testing.disable_span_filling():
+        mod, params = relay.frontend.from_pytorch(scripted_model, shape_list)
+    with tvm.testing.enable_span_filling():
+        mod_with_span, _ = relay.frontend.from_pytorch(scripted_model, shape_list)
+    assert tvm.ir.structural_equal(mod, mod_with_span, map_free_vars=True)
 
     data = process_image(img)
     data_np = data.detach().numpy()

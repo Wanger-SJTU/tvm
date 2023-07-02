@@ -57,14 +57,14 @@ using FCommReduce = std::function<Array<PrimExpr>(Array<PrimExpr> exprs, const A
  * \param ndim Number of dimensions in the target.
  * \param axis The axis parameter.
  *
- * \return A non-empty sorted array of valid dimension indices, with no duplicates.
- * If the input axis is empty, the result will be an axis including all dimensions.
+ * \return A sorted array of valid dimension indices, with no duplicates.
+ * If the input axis is None, the result will be an axis including all dimensions.
  * If any input element is negative, it will be treated as an offset from the
  * last dimension (same as python indexing rules).
  */
 inline std::vector<int> GetRealAxis(int ndim, const Array<Integer>& axis) {
   std::vector<int> real_axis;
-  if (!axis.defined() || axis.size() == 0) {
+  if (!axis.defined()) {
     for (int i = 0; i < ndim; ++i) {
       real_axis.push_back(i);
     }
@@ -75,7 +75,7 @@ inline std::vector<int> GetRealAxis(int ndim, const Array<Integer>& axis) {
       if (val < 0) {
         val += ndim;
       }
-      ICHECK_LE(val, ndim) << " exceeds the maximum dimension " << ndim;
+      ICHECK_LT(val, ndim) << " exceeds the maximum dimension " << ndim;
       ICHECK_GE(val, 0);
       real_axis.push_back(static_cast<int>(val));
     }
@@ -325,25 +325,36 @@ inline PrimExpr ProdOp(PrimExpr source, Array<IterVar> axis, Array<PrimExpr> ini
  */
 inline Tensor sum(const Tensor& data, const Array<Integer>& axis, bool keepdims = false,
                   bool atleast1d = false) {
-  return CommReduce(data, axis, tvm::sum, keepdims, atleast1d);
+  if (data->dtype.is_bool()) {
+    return CommReduce(data, axis, tvm::any, keepdims, atleast1d);
+  } else {
+    return CommReduce(data, axis, tvm::sum, keepdims, atleast1d);
+  }
 }
 
 inline Tensor collapse_sum(const Tensor& data, Array<PrimExpr> target_shape) {
-  ICHECK_GE(data->shape.size(), target_shape.size());
-  auto ishape = detail::GetConstIntValues(data->shape, "ishape");
-  auto oshape = detail::GetConstIntValues(target_shape, "oshape");
+  const auto& ishape = data->shape;
+  const auto& oshape = target_shape;
+  int isize = data->shape.size();
+  int osize = target_shape.size();
+
+  ICHECK_GE(isize, osize)
+      << "Invalid collapse: input dimensionality smaller than output dimensionality.\ninput shape: "
+      << data->shape << "\nvs\noutput shape: " << target_shape;
 
   std::vector<int> reduce_axes;
   std::vector<int> squeeze_axes;
-  for (int i_ax = ishape.size() - 1, o_ax = oshape.size() - 1; i_ax >= 0; --i_ax) {
-    if (o_ax >= 0 && ishape[i_ax] == oshape[o_ax]) {
+  tvm::PrimExpr one(1);
+
+  for (int i_ax = isize - 1, o_ax = osize - 1; i_ax >= 0; --i_ax) {
+    if (o_ax >= 0 && topi::detail::EqualCheck(ishape[i_ax], oshape[o_ax])) {
       --o_ax;
       continue;
     }
     reduce_axes.push_back(i_ax);
     if (o_ax < 0) {  // squeeze o_ax if was added during expansion
       squeeze_axes.push_back(i_ax);
-    } else if (oshape[o_ax] == 1) {
+    } else if (topi::detail::EqualCheck(one, oshape[o_ax])) {
       --o_ax;
     }
   }
@@ -431,6 +442,45 @@ inline Tensor max(const Tensor& data, const Array<Integer>& axis, bool keepdims 
   return CommReduce(data, axis, MaxOp, keepdims, atleast1d);
 }
 
+inline FCommReduce MakeArgminReducer(bool select_last_index = false) {
+  // Create a Commutative Reducer with a comparison operation, and method to get the initial value.
+  auto fcombine = [=](Array<Var> lhs, Array<Var> rhs) {
+    Array<PrimExpr> result;
+
+    // Casting to avoid operator ambiguity
+    PrimExpr lhs_idx = static_cast<PrimExpr>(lhs[0]);
+    PrimExpr rhs_idx = static_cast<PrimExpr>(rhs[0]);
+    PrimExpr lhs_val = static_cast<PrimExpr>(lhs[1]);
+    PrimExpr rhs_val = static_cast<PrimExpr>(rhs[1]);
+
+    // These variables compare the actual values of the array
+    auto is_smaller = lhs_val < rhs_val;
+    auto is_same = lhs_val == rhs_val;
+
+    // This checks if the indices are correct for the reduction. E.g. for select_last_index
+    // it gives precedence for later indices of the same element and precedence for sooner
+    // indices if not select_last_index;
+    PrimExpr proper_index;
+    if (select_last_index) {
+      proper_index = lhs_idx > rhs_idx;
+    } else {
+      proper_index = lhs_idx < rhs_idx;
+    }
+
+    PrimExpr update_index = is_smaller || (is_same && proper_index);
+    result.push_back(tvm::tir::Select(update_index, lhs[0], rhs[0]));  // idx
+    result.push_back(tvm::tir::Select(is_smaller, lhs[1], rhs[1]));    // val
+    return result;
+  };
+  auto fidentity = [&](std::vector<DataType> types) {
+    Array<PrimExpr> result;
+    result.push_back(tvm::tir::make_const(types[0], -1));  // idx
+    result.push_back(tvm::max_value(types[1]));            // val
+    return result;
+  };
+  return MakeCommReducer(fcombine, fidentity, "argmin");
+}
+
 /*!
  * \brief Creates an operation that finds the indices of the minimum
  * values over a given axis.
@@ -442,35 +492,48 @@ inline Tensor max(const Tensor& data, const Array<Integer>& axis, bool keepdims 
  * left in the result as dimensions with size one. This enables the result
  * to broadcast correctly against the input array.
  * \param atleast1d Whether the output need to be atleast1d.
+ * \param select_last_index Whether to select the last index if the minimum element
+ * appears multiple times, else select the first index.
  *
  * \return A Tensor whose op member is the argmin operation
  */
 inline Tensor argmin(const Tensor& data, const Array<Integer>& axis, bool keepdims = false,
-                     bool atleast1d = false) {
-  auto fcombine = [](Array<Var> lhs, Array<Var> rhs) {
-    Array<PrimExpr> result;
-    result.push_back(tvm::tir::Select(lhs[1] <= rhs[1], lhs[0], rhs[0]));  // idx
-    result.push_back(tvm::tir::Select(lhs[1] <= rhs[1], lhs[1], rhs[1]));  // val
-    return result;
-  };
-  auto fidentity = [](std::vector<DataType> types) {
-    Array<PrimExpr> result;
-    result.push_back(tvm::tir::make_const(types[0], -1));  // idx
-    result.push_back(tvm::max_value(types[1]));            // val
-    return result;
-  };
-  auto func = MakeCommReducer(fcombine, fidentity, "argmin");
-  return CommReduceIdx(data, axis, func, keepdims, atleast1d);
+                     bool atleast1d = false, bool select_last_index = false) {
+  auto reducer = MakeArgminReducer(select_last_index);
+  return CommReduceIdx(data, axis, reducer, keepdims, atleast1d);
 }
 
-inline FCommReduce MakeArgmaxReducer() {
-  auto fcombine = [](Array<Var> lhs, Array<Var> rhs) {
+inline FCommReduce MakeArgmaxReducer(bool select_last_index = false) {
+  // Create a Commutative Reducer with a comparison operation, and method to get the initial value.
+  auto fcombine = [=](Array<Var> lhs, Array<Var> rhs) {
     Array<PrimExpr> result;
-    result.push_back(tvm::tir::Select(lhs[1] >= rhs[1], lhs[0], rhs[0]));  // idx
-    result.push_back(tvm::tir::Select(lhs[1] >= rhs[1], lhs[1], rhs[1]));  // val
+
+    // Casting to avoid operator ambiguity
+    PrimExpr lhs_idx = static_cast<PrimExpr>(lhs[0]);
+    PrimExpr rhs_idx = static_cast<PrimExpr>(rhs[0]);
+    PrimExpr lhs_val = static_cast<PrimExpr>(lhs[1]);
+    PrimExpr rhs_val = static_cast<PrimExpr>(rhs[1]);
+
+    // These variables compare the actual values of the array
+    auto is_bigger = lhs_val > rhs_val;
+    auto is_same = lhs_val == rhs_val;
+
+    // This checks if the indices are correct for the reduction. E.g. for select_last_index
+    // it gives precedence for later indices of the same element and precedence for sooner
+    // indices if not select_last_index;
+    PrimExpr proper_index;
+    if (select_last_index) {
+      proper_index = lhs_idx > rhs_idx;
+    } else {
+      proper_index = lhs_idx < rhs_idx;
+    }
+
+    PrimExpr update_index = is_bigger || (is_same && proper_index);
+    result.push_back(tvm::tir::Select(update_index, lhs[0], rhs[0]));  // idx
+    result.push_back(tvm::tir::Select(is_bigger, lhs[1], rhs[1]));     // val
     return result;
   };
-  auto fidentity = [](std::vector<DataType> types) {
+  auto fidentity = [&](std::vector<DataType> types) {
     Array<PrimExpr> result;
     result.push_back(tvm::tir::make_const(types[0], -1));  // idx
     result.push_back(tvm::min_value(types[1]));            // val
@@ -490,12 +553,13 @@ inline FCommReduce MakeArgmaxReducer() {
  * left in the result as dimensions with size one. This enables the result
  * to broadcast correctly against the input array.
  * \param atleast1d Whether the output need to be atleast1d.
- *
+ * \param select_last_index Whether to select the last index if the maximum element
+ * appears multiple times, else select the first index.
  * \return A Tensor whose op member is the argmax operation
  */
 inline Tensor argmax(const Tensor& data, const Array<Integer>& axis, bool keepdims = false,
-                     bool atleast1d = false) {
-  auto reducer = MakeArgmaxReducer();
+                     bool atleast1d = false, bool select_last_index = false) {
+  auto reducer = MakeArgmaxReducer(select_last_index);
   return CommReduceIdx(data, axis, reducer, keepdims, atleast1d);
 }
 
@@ -515,6 +579,29 @@ inline Tensor argmax(const Tensor& data, const Array<Integer>& axis, bool keepdi
 inline Tensor prod(const Tensor& data, const Array<Integer>& axis, bool keepdims = false,
                    bool atleast1d = false) {
   return CommReduce(data, axis, ProdOp, keepdims, atleast1d);
+}
+
+/*!
+ * \brief Create communitive reducer summing over tuples
+ */
+inline FCommReduce MakeTupleSumReducer() {
+  auto fcombine = [](Array<Var> lhs, Array<Var> rhs) {
+    Array<PrimExpr> result;
+    ICHECK_EQ(lhs.size(), rhs.size());
+    result.reserve(lhs.size());
+    for (size_t i = 0; i < lhs.size(); ++i) {
+      result.push_back(lhs[i] + rhs[i]);
+    }
+    return result;
+  };
+  auto fidentity = [](std::vector<DataType> types) {
+    Array<PrimExpr> result;
+    for (size_t i = 0; i < types.size(); ++i) {
+      result.push_back(tvm::tir::make_const(types[i], 0));
+    }
+    return result;
+  };
+  return MakeCommReducer(fcombine, fidentity, "tuple_sum");
 }
 
 }  // namespace topi

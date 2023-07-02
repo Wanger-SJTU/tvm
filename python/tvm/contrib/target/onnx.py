@@ -34,12 +34,44 @@ from tvm.relay.ty import TupleType, TensorType
 ONNX_OPSET_VERSONS_SUPPORTED = [11]
 
 
+def run_onnx_optimizer(onnx_model):
+    """Run ONNX's optimization routines.
+
+    ONNX Optimizer was moved to an external library in
+    version 1.9.  Attempt to use the optimizer in onnx if
+    it is available, fall back to the standalone
+    onnxoptimizer otherwise, and return the model
+    unoptimized if neither are available.
+
+    """
+    try:
+        onnx_polish_model = onnx.utils.polish_model
+    except AttributeError:
+        pass
+    else:
+        return onnx_polish_model(onnx_model)
+
+    try:
+        # pylint: disable=import-outside-toplevel
+        import onnxoptimizer
+    except ImportError:
+        pass
+    else:
+        return onnxoptimizer.optimize(onnx_model)
+
+    return onnx_model
+
+
 def tvm_array_to_list(arr):
     return tuple(x.value for x in arr)
 
 
 def get_onnx_version():
     return onnx.__version__
+
+
+def get_node_shape(node):
+    return tuple("Any" if isinstance(i, tvm.tir.Any) else int(i) for i in node.shape)
 
 
 def infer_type(node):
@@ -59,15 +91,13 @@ def call_node_infer_type(node):
     elif isinstance(out_type, TupleType):
         types = list(out_type.fields)
     else:
-        raise RuntimeError(
-            "Unsupported output type %s in operator %s" % (type(out_type), node.op.nae)
-        )
+        raise RuntimeError(f"Unsupported output type {type(out_type)} in operator {node.op.name}")
 
     return types
 
 
 def add_input(data, name, prefix, model_container):
-    input_name = "{}_{}".format(prefix, name)
+    input_name = f"{prefix}_{name}"
     dtype = onnx.mapping.NP_TYPE_TO_TENSOR_TYPE[data.dtype]
     tensor_value_info = onnx.helper.make_tensor_value_info(input_name, dtype, shape=data.shape)
     model_container.add_inputs([tensor_value_info])
@@ -180,7 +210,7 @@ class MatMul(OpConverter):
 
     @classmethod
     def convert(cls, node_entry, model_container, node_dict):
-        inter_output_name = "inter{}".format(node_entry["name"])
+        inter_output_name = f"inter{node_entry['name']}"
         transpose_node = onnx.helper.make_node(
             Transpose.__name__, [node_entry["input_names"][1]], [inter_output_name], perm=(1, 0)
         )
@@ -196,9 +226,7 @@ class Flatten(OpConverter):
 
     @classmethod
     def convert_attributes(cls, attrs):
-        return {
-            "axis": 1,
-        }
+        return {"axis": 1}
 
 
 class BatchNormalization(OpConverter):
@@ -206,10 +234,7 @@ class BatchNormalization(OpConverter):
 
     @classmethod
     def convert_attributes(cls, attrs):
-        return {
-            "epsilon": float(attrs.get_str("epsilon")),
-            "axis": float(attrs.get_int("axis")),
-        }
+        return {"epsilon": float(attrs.get_str("epsilon")), "axis": float(attrs.get_int("axis"))}
 
     @classmethod
     def convert(cls, node_entry, model_container, node_dict):
@@ -221,7 +246,7 @@ class BatchNormalization(OpConverter):
         inter_output_names = [node_entry["output_names"][0]]
         # axis==3 means channel is specified along the 3rd axis
         if attrs["axis"] == 3:
-            transpose_out_name = "transpose_{}".format(node_entry["name"])
+            transpose_out_name = f"transpose_{node_entry['name']}"
             node_transposed = onnx.helper.make_node(
                 Transpose.__name__,
                 [node_entry["input_names"][0]],
@@ -229,7 +254,7 @@ class BatchNormalization(OpConverter):
                 perm=[0, 3, 1, 2],
             )
             model_container.add_nodes([node_transposed])
-            inter_output_names = ["batch_norm_{}".format(node_entry["name"])]
+            inter_output_names = [f"batch_norm_{node_entry['name']}"]
 
         input_names = [transpose_out_name] + node_entry["input_names"][1:]
         batch_norm_node = onnx.helper.make_node(
@@ -252,9 +277,7 @@ class Dropout(OpConverter):
 
     @classmethod
     def convert_attributes(cls, attrs):
-        return {
-            "ratio": float(attrs.get_str("rate")),
-        }
+        return {"ratio": float(attrs.get_str("rate"))}
 
 
 class AveragePool(MaxPool):
@@ -266,9 +289,7 @@ class Concat(OpConverter):
 
     @classmethod
     def convert_attributes(cls, attrs):
-        return {
-            "axis": attrs.get_int("axis"),
-        }
+        return {"axis": attrs.get_int("axis")}
 
 
 class BiasAdd(OpConverter):
@@ -285,7 +306,7 @@ class BiasAdd(OpConverter):
             axis = axis + data_ndim
         new_axes = data_ndim - axis - 1
         if new_axes:
-            inter_output_name = "inter{}".format(node_entry["name"])
+            inter_output_name = f"inter{node_entry['name']}"
             unsqueeze_node = onnx.helper.make_node(
                 "Unsqueeze",
                 [node_entry["input_names"][1]],
@@ -347,10 +368,7 @@ class Pad(OpConverter):
             after.append(axis_pads[1])
         pads = before + after
         pads = numpy.asarray(pads, dtype=pads[0].dtype)
-        return {
-            "pads": pads,
-            "mode": attrs.get_str("pad_mode"),
-        }
+        return {"pads": pads, "mode": attrs.get_str("pad_mode")}
 
     @classmethod
     def convert(cls, node_entry, model_container, node_dict):
@@ -380,9 +398,7 @@ class Softmax(OpConverter):
 
     @classmethod
     def convert_attributes(cls, attrs):
-        return {
-            "axis": attrs.axis,
-        }
+        return {"axis": attrs.axis}
 
 
 class Squeeze(OpConverter):
@@ -390,9 +406,7 @@ class Squeeze(OpConverter):
 
     @classmethod
     def convert_attributes(cls, attrs):
-        return {
-            "axes": attrs.axis,
-        }
+        return {"axes": attrs.axis}
 
     @classmethod
     def convert(cls, node_entry, model_container, node_dict):
@@ -481,10 +495,7 @@ class Split(OpConverter):
         if isinstance(indices_or_sections, tvm.ir.PrimExpr):
             indices_or_sections = indices_or_sections.value
 
-        return {
-            "indices_or_section": indices_or_sections,
-            "axis": attrs.get_int("axis"),
-        }
+        return {"indices_or_section": indices_or_sections, "axis": attrs.get_int("axis")}
 
     @classmethod
     def convert(cls, node_entry, model_container, node_dict):
@@ -493,7 +504,7 @@ class Split(OpConverter):
         input_node = node_dict[node_entry["inputs"][0]]
         assert len(input_node) == 1, "input node can not be a Tuple"
         input_node = input_node[0]
-        shape = input_node["types"][0].concrete_shape
+        shape = get_node_shape(input_node["types"][0])
 
         indices_or_sect = attrs["indices_or_section"]
         axis = attrs["axis"]
@@ -647,15 +658,15 @@ class LRN(OpConverter):
         Onnx only supports axis=1 (channels)."""
         if attrs.get_int("axis") != 1:
             raise RuntimeError(
-                "Unsupported axis %s in operator relay lrn operator. "
-                "Only axis = 1 is supported by Onnx." % (attrs.get_int("axis"))
+                f"Unsupported axis {attrs.get_int('axis')} in operator relay lrn operator. "
+                f"Only axis = 1 is supported by Onnx."
             )
 
         return {"alpha": attrs.alpha, "beta": attrs.beta, "bias": attrs.bias, "size": attrs.size}
 
 
 class Cast(OpConverter):
-    """ Operator converter for Cast."""
+    """Operator converter for Cast."""
 
     @classmethod
     def convert_attributes(cls, attrs):
@@ -675,7 +686,7 @@ class Resize(OpConverter):
         elif "cubic" in method:  # cubic / bicubic
             mode = b"cubic"
         else:
-            raise RuntimeError("Unsupported method %s in operator Resize" % method)
+            raise RuntimeError(f"Unsupported method {method} in operator Resize")
 
         coord_trans = attrs.get_str("coordinate_transformation_mode")
         if coord_trans == "half_pixel":
@@ -686,7 +697,7 @@ class Resize(OpConverter):
             coord_trans = b"asymmetric"
         else:
             raise RuntimeError(
-                "Unsupported coordinate transform mode %s in operator Resize" % coord_trans
+                f"Unsupported coordinate transform mode {coord_trans} in operator Resize"
             )
 
         rounding_method = attrs.get_str("rounding_method")
@@ -697,9 +708,7 @@ class Resize(OpConverter):
         elif rounding_method == "ceil":
             rounding_method = b"ceil"
         else:
-            raise RuntimeError(
-                "Unsupported rounding method %s in operator Resize" % rounding_method
-            )
+            raise RuntimeError(f"Unsupported rounding method {rounding_method} in operator Resize")
 
         size = attrs.get_int_tuple("size")
 
@@ -881,8 +890,7 @@ class RelayToONNXConverter(ExprVisitor):
         self.visit(func)
         self._add_output(self._node_dict[self.last_node])
         model = self._mc.make_model()
-        polished_model = onnx.utils.polish_model(model)
-        return polished_model
+        return run_onnx_optimizer(model)
 
     def visit(self, expr):
         self._node_count += 1
@@ -928,7 +936,7 @@ class RelayToONNXConverter(ExprVisitor):
     def visit_call(self, call):
         node_index = self._node_count
         op = call.op
-        name = "{}_{}".format(op, node_index)
+        name = f"{op}_{node_index}"
         node_entry = self._get_node_entry(call, name)
 
         node_entry["op"] = op
@@ -955,7 +963,7 @@ class RelayToONNXConverter(ExprVisitor):
         """Convert Relay operator node to ONNX operator and add it to container nodes list"""
         if node_entry["op"].name not in relay_to_onnx_op_mapping:
             raise NotImplementedError(
-                "Currently the operator '{0}' is " "not supported.".format(node_entry["op"].name)
+                f"Currently the operator '{node_entry['op'].name}' is " "not supported."
             )
         converter = relay_to_onnx_op_mapping[node_entry["op"].name]()
 
@@ -964,9 +972,9 @@ class RelayToONNXConverter(ExprVisitor):
     def _add_params(self, node_entry, idx):
         """Add param value to initializer and name to inputs"""
         param_name = node_entry["name"]
-        assert (
-            param_name in self._params
-        ), "The parameter {0} is not present" "in params dict provided.".format(param_name)
+        assert param_name in self._params, (
+            f"The parameter {param_name} is not present" "in params dict provided."
+        )
         value = self._params[param_name]
         numpy_array = value.numpy()
         tensor = numpy_helper.from_array(numpy_array, param_name)
@@ -992,7 +1000,7 @@ class RelayToONNXConverter(ExprVisitor):
             node_type = node_entry["types"][0]
             dtype = onnx.mapping.NP_TYPE_TO_TENSOR_TYPE[numpy.dtype(node_type.dtype)]
             input = onnx.helper.make_tensor_value_info(
-                node_entry["name"], dtype, shape=node_type.concrete_shape
+                node_entry["name"], dtype, shape=get_node_shape(node_type)
             )
             self._mc.add_inputs([input])
 
@@ -1003,7 +1011,7 @@ class RelayToONNXConverter(ExprVisitor):
             for node_type, output_name in zip(node_entry["types"], node_entry["output_names"]):
                 dtype = onnx.mapping.NP_TYPE_TO_TENSOR_TYPE[numpy.dtype(node_type.dtype)]
                 output = onnx.helper.make_tensor_value_info(
-                    output_name, dtype, shape=node_type.concrete_shape
+                    output_name, dtype, shape=get_node_shape(node_type)
                 )
                 self._mc.add_outputs([output])
 
@@ -1040,10 +1048,8 @@ def to_onnx(relay_ir, params, name, opset_version=11, path=None):
 
     if opset_version > defs.onnx_opset_version():
         raise Exception(
-            "The ONNX package installed of version {} does not support the opset "
-            "version {}. Upgrade the ONNX package to latest version.".format(
-                get_onnx_version(), opset_version
-            )
+            f"The ONNX package installed of version {get_onnx_version()} does not support the "
+            f"opset version {opset_version}. Upgrade the ONNX package to latest version."
         )
 
     func = relay_ir["main"] if isinstance(relay_ir, tvm.ir.IRModule) else relay_ir
@@ -1101,4 +1107,4 @@ def save_to_file(hex_str, path=None, fmt="onnx"):
         offset = stop + model_size
 
         model_onnx = onnx.load_model_from_string(model_serialized)
-        onnx.save(model_onnx, "{}{}{}.{}".format(path, os.path.sep, name, fmt))
+        onnx.save(model_onnx, f"{path}{os.path.sep}{name}.{fmt}")

@@ -40,6 +40,7 @@
 
 #include "../../support/arena.h"
 #include "../../support/ring_buffer.h"
+#include "../../support/utils.h"
 #include "../object_internal.h"
 #include "rpc_local_session.h"
 
@@ -372,8 +373,11 @@ class RPCEndpoint::EventHandler : public dmlc::Stream {
     if (code == RPCCode::kException) {
       // switch to the state before sending exception.
       this->SwitchToState(kRecvPacketNumBytes);
-      std::string msg = args[0];
-      LOG(FATAL) << "RPCError: Error caught from RPC call:\n" << msg;
+      String msg = args[0];
+      if (!support::StartsWith(msg, "RPCSessionTimeoutError: ")) {
+        msg = "RPCError: Error caught from RPC call:\n" + msg;
+      }
+      LOG(FATAL) << msg;
     }
 
     ICHECK(setreturn != nullptr) << "fsetreturn not available";
@@ -623,6 +627,9 @@ class RPCEndpoint::EventHandler : public dmlc::Stream {
 
 RPCCode RPCEndpoint::HandleUntilReturnEvent(bool client_mode, RPCSession::FEncodeReturn setreturn) {
   RPCCode code = RPCCode::kCallFunc;
+
+  CHECK(channel_) << "Expected connection to server " << name_
+                  << " to be active, but the connection was previously closed";
   while (code != RPCCode::kReturn && code != RPCCode::kShutdown && code != RPCCode::kCopyAck) {
     while (writer_.bytes_available() != 0) {
       writer_.ReadWithCallback(
@@ -684,18 +691,21 @@ void RPCEndpoint::Init() {
 
 /*!
  * \brief Create a new RPCEndpoint instance.
- * \param channel RPCChannel used to communicate
+ * \param channel RPCChannel used to communicate.
  * \param name Name of this session, used to identify log messages from this RPCEndpoint instance.
- * \param The remote key reported during protocol initialization, or "%toinit" if the RPCEndpoint
- *     should handle this phase of the protocol for you. Some servers may prefer to access parts of
- *     the key to modify their behavior.
+ * \param remote_key The remote key reported during protocol initialization, or "%toinit" if the
+ * RPCEndpoint should handle this phase of the protocol for you. Some servers may prefer to access
+ * parts of the key to modify their behavior.
+ * \param fcleanup The cleanup Packed function.
  */
 std::shared_ptr<RPCEndpoint> RPCEndpoint::Create(std::unique_ptr<RPCChannel> channel,
-                                                 std::string name, std::string remote_key) {
+                                                 std::string name, std::string remote_key,
+                                                 TypedPackedFunc<void()> fcleanup) {
   std::shared_ptr<RPCEndpoint> endpt = std::make_shared<RPCEndpoint>();
   endpt->channel_ = std::move(channel);
   endpt->name_ = std::move(name);
   endpt->remote_key_ = std::move(remote_key);
+  endpt->fcleanup_ = fcleanup;
   endpt->Init();
   return endpt;
 }
@@ -734,6 +744,7 @@ void RPCEndpoint::ServerLoop() {
     (*f)();
   }
   channel_.reset(nullptr);
+  if (fcleanup_ != nullptr) fcleanup_();
 }
 
 int RPCEndpoint::ServerAsyncIOEventHandler(const std::string& in_bytes, int event_flag) {
@@ -1121,6 +1132,8 @@ class RPCClientSession : public RPCSession, public DeviceAPI {
   DeviceAPI* GetDeviceAPI(Device dev, bool allow_missing) final { return this; }
 
   bool IsLocalSession() const final { return false; }
+
+  void Shutdown() final { endpoint_->Shutdown(); }
 
  private:
   uint64_t GetRPCMaxTransferSize() {

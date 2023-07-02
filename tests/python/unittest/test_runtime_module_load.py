@@ -16,13 +16,12 @@
 # under the License.
 import tvm
 from tvm import te
-from tvm.contrib import cc, utils
-import ctypes
-import os
+from tvm.contrib import cc, utils, popen_pool
 import sys
 import numpy as np
 import subprocess
 import tvm.testing
+from tvm.relay.backend import Runtime
 
 runtime_py = """
 import os
@@ -59,7 +58,7 @@ def test_dso_module_load():
             0,
             n - 1,
             tvm.tir.ForKind.SERIAL,
-            tvm.tir.Store(Ab.data, tvm.tir.Load(dtype, Ab.data, i) + 1, i + 1),
+            tvm.tir.BufferStore(Ab, tvm.tir.BufferLoad(Ab, [i]) + 1, [i + 1]),
         )
         mod = tvm.IRModule.from_expr(
             tvm.tir.PrimFunc([Ab], stmt).with_attr("global_symbol", "main")
@@ -88,7 +87,12 @@ def test_dso_module_load():
     with open(path_runtime_py, "w") as fo:
         fo.write(runtime_py)
 
-    subprocess.check_call("python3 %s %s %s" % (path_runtime_py, path_dso, dtype), shell=True)
+    proc = subprocess.run(
+        [sys.executable, path_runtime_py, path_dso, dtype],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert proc.returncode == 0, f"{proc.args} exited with {proc.returncode}: {proc.stdout}"
 
 
 @tvm.testing.requires_gpu
@@ -112,7 +116,8 @@ def test_device_module_dump():
         temp = utils.tempdir()
         name = "myadd_%s" % device
         if sys.platform == "darwin" or sys.platform.startswith("linux"):
-            f = tvm.build(s, [A, B], device, "llvm -system-lib", name=name)
+            runtime = Runtime("cpp", {"system-lib": True})
+            f = tvm.build(s, [A, B], device, "llvm", runtime=runtime, name=name)
         elif sys.platform == "win32":
             f = tvm.build(s, [A, B], device, "llvm", name=name)
         else:
@@ -122,15 +127,24 @@ def test_device_module_dump():
         # test cross compiler function
         f.export_library(path_dso, cc.cross_compiler("g++"))
 
-        f1 = tvm.runtime.load_module(path_dso)
-        a = tvm.nd.array(np.random.uniform(size=1024).astype(A.dtype), dev)
-        b = tvm.nd.array(np.zeros(1024, dtype=A.dtype), dev)
-        f1(a, b)
-        np.testing.assert_equal(b.numpy(), a.numpy() + 1)
-        if sys.platform != "win32":
-            f2 = tvm.runtime.system_lib()
-            f2[name](a, b)
+        def popen_check():
+            import tvm
+            import sys
+
+            f1 = tvm.runtime.load_module(path_dso)
+            a = tvm.nd.array(np.random.uniform(size=1024).astype(A.dtype), dev)
+            b = tvm.nd.array(np.zeros(1024, dtype=A.dtype), dev)
+            f1(a, b)
             np.testing.assert_equal(b.numpy(), a.numpy() + 1)
+            if sys.platform != "win32":
+                f2 = tvm.runtime.system_lib()
+                f2[name](a, b)
+                np.testing.assert_equal(b.numpy(), a.numpy() + 1)
+
+        # system lib should be loaded in different process
+        worker = popen_pool.PopenWorker()
+        worker.send(popen_check)
+        worker.recv()
 
     def check_stackvm(device):
         dev = tvm.device(device, 0)
@@ -193,24 +207,35 @@ def test_combine_module_llvm():
             print("Skip because llvm is not enabled")
             return
         temp = utils.tempdir()
-        fadd1 = tvm.build(s, [A, B], "llvm -system-lib", name="myadd1")
-        fadd2 = tvm.build(s, [A, B], "llvm -system-lib", name="myadd2")
+        runtime = Runtime("cpp", {"system-lib": True})
+        fadd1 = tvm.build(s, [A, B], "llvm", runtime=runtime, name="myadd1")
+        fadd2 = tvm.build(s, [A, B], "llvm", runtime=runtime, name="myadd2")
         path1 = temp.relpath("myadd1.o")
         path2 = temp.relpath("myadd2.o")
         path_dso = temp.relpath("mylib.so")
         fadd1.save(path1)
         fadd2.save(path2)
         cc.create_shared(path_dso, [path1, path2])
-        # Load dll, will trigger system library registration
-        dll = ctypes.CDLL(path_dso)
-        # Load the system wide library
-        mm = tvm.runtime.system_lib()
-        a = tvm.nd.array(np.random.uniform(size=nn).astype(A.dtype), dev)
-        b = tvm.nd.array(np.zeros(nn, dtype=A.dtype), dev)
-        mm["myadd1"](a, b)
-        np.testing.assert_equal(b.numpy(), a.numpy() + 1)
-        mm["myadd2"](a, b)
-        np.testing.assert_equal(b.numpy(), a.numpy() + 1)
+
+        def popen_check():
+            import tvm.runtime
+            import ctypes
+
+            # Load dll, will trigger system library registration
+            ctypes.CDLL(path_dso)
+            # Load the system wide library
+            mm = tvm.runtime.system_lib()
+            a = tvm.nd.array(np.random.uniform(size=nn).astype(A.dtype), dev)
+            b = tvm.nd.array(np.zeros(nn, dtype=A.dtype), dev)
+            mm["myadd1"](a, b)
+            np.testing.assert_equal(b.numpy(), a.numpy() + 1)
+            mm["myadd2"](a, b)
+            np.testing.assert_equal(b.numpy(), a.numpy() + 1)
+
+        # system lib should be loaded in different process
+        worker = popen_pool.PopenWorker()
+        worker.send(popen_check)
+        worker.recv()
 
     if sys.platform != "win32":
         check_system_lib()

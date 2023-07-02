@@ -98,7 +98,7 @@ def main(model_str, output_path):
         pass
     print("building...")
     with tvm.transform.PassContext(opt_level=3):
-        graph, lib, params = relay.build(net, target, target_host=target_host, params=params)
+        graph, lib, params = relay.build(net, tvm.target.Target(target, target_host), params=params)
     print("dumping lib...")
     lib.export_library(output_path_str + "/" + "deploy_lib_cpu.so", ndk.create_shared)
     print("dumping graph...")
@@ -106,7 +106,7 @@ def main(model_str, output_path):
         f.write(graph)
     print("dumping params...")
     with open(output_path_str + "/" + "deploy_param.params", "wb") as f:
-        f.write(runtime.save_param_dict(params))
+        f.write(tvm.runtime.save_param_dict(params))
     print("dumping labels...")
     synset_url = "".join(
         [
@@ -130,7 +130,7 @@ if __name__ == "__main__":
         raise RuntimeError("Require environment variable TVM_NDK_CC")
     models_path = Path().absolute().parent.joinpath("app/src/main/assets/models/")
     if not models_path.exists():
-        models_path.mkdir()
+        models_path.mkdir(parents=True)
     models = {
         "mobilenet_v2": models_path.joinpath("mobilenet_v2"),
         "resnet18_v1": models_path.joinpath("resnet18_v1"),

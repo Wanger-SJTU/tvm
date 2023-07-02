@@ -21,9 +21,10 @@ import math
 import tempfile
 
 import tvm
-from tvm import te, auto_scheduler
+from tvm import te, auto_scheduler, relay
+from tvm.script import tir as T
 
-from test_auto_scheduler_common import matmul_auto_scheduler_test
+from tvm.testing.auto_scheduler import matmul_auto_scheduler_test
 
 
 def fequal(a, b):
@@ -66,7 +67,7 @@ def test_cpu_matmul():
 
     """
     lowered IR:
-    
+
     Placeholder: A, B
     parallel i.0 (0,32)
       parallel j.0 (0,64)
@@ -77,8 +78,8 @@ def test_cpu_matmul():
     """
 
     # check touched memory in bytes, touched unique memory in bytes, reuse distance, etc.
-    assert fequal(fea_dict[c_name + ".bytes"], math.log2(512 ** 3 * 4 + 1))
-    assert fequal(fea_dict[b_name + ".unique_bytes"], math.log2(512 ** 2 * 4 + 1))
+    assert fequal(fea_dict[c_name + ".bytes"], math.log2(512**3 * 4 + 1))
+    assert fequal(fea_dict[b_name + ".unique_bytes"], math.log2(512**2 * 4 + 1))
     assert fequal(fea_dict[c_name + ".reuse_dis_iter"], math.log2(8 * 16 + 1))
     assert fequal(fea_dict[c_name + ".reuse_dis_bytes"], math.log2((8 * 16 + 8 + 16) * 4 + 1))
     assert fequal(fea_dict[c_name + ".reuse_ct"], math.log2(512 + 1))
@@ -198,6 +199,104 @@ def test_gpu_feature():
         assert fequal(fea_dicts[0]["threadIdx_y_len"], math.log2(1 + 1))
         assert fequal(fea_dicts[2]["blockIdx_z_len"], math.log2(1 + 1))
         assert fequal(fea_dicts[0]["is_gpu"], 1.0)
+
+
+@T.prim_func
+def tir_matmul(
+    A: T.Buffer((256, 256), "float32"),
+    B: T.Buffer((256, 256), "float32"),
+    C: T.Buffer((256, 256), "float32"),
+) -> None:
+    # function attr dict
+    T.func_attr({"from_legacy_te_schedule": True, "global_symbol": "main", "tir.noalias": True})
+    A_flat = T.Buffer([16384], dtype="float32", data=A.data)
+    B_flat = T.Buffer([16384], dtype="float32", data=B.data)
+    C_flat = T.Buffer([16384], dtype="float32", data=C.data)
+    # body
+    for x, y in T.grid(128, 128):
+        C_flat[x * 128 + y] = T.float32(0)
+        for k in T.serial(128):
+            C_flat[x * 128 + y] = C_flat[x * 128 + y] + A_flat[x * 128 + k] * B_flat[y * 128 + k]
+
+
+def test_primfunc_without_lowering():
+    features = auto_scheduler.feature.named_features_from_primfunc(tir_matmul)
+    assert features["float_mad"].shape == (1,)
+    # featurization does not handle multiple-add right now, so they are split out
+    assert abs(features["float_addsub"][0] - 128 * 128 * 128) < 10
+    assert abs(features["float_mul"][0] - 128 * 128 * 128) < 10
+    for i in range(0, 3):
+        assert abs(features[f"B{i}.unique_bytes"][0] - 128 * 128 * 4) < 10  # 4 bytes per float32
+
+
+def test_primfunc_lowered():
+    # Lower tir function so all passes get applied
+    f = tvm.lower(tir_matmul)
+    features = auto_scheduler.feature.named_features_from_primfunc(f["main"])
+    assert features["float_mad"].shape == (1,)
+    # featurization does not handle multiple-add right now, so they are split out
+    assert abs(features["float_addsub"][0] - 128 * 128 * 128) < 10
+    assert abs(features["float_mul"][0] - 128 * 128 * 128) < 10
+    for i in range(0, 3):
+        assert abs(features[f"B{i}.unique_bytes"][0] - 128 * 128 * 4) < 10  # 4 bytes per float32
+
+
+def test_dense_lowered():
+    a = relay.var("a", relay.TensorType((128, 128), "float32"))
+    b = relay.var("b", relay.TensorType((128, 128), "float32"))
+    c = relay.nn.dense(a, b)
+    mod = tvm.IRModule.from_expr(relay.Function([a, b], c))
+    target = "llvm"
+    comp = relay.vm.VMCompiler()
+    mod, params = comp.optimize(mod, params={}, target=target)
+    for name, func in mod.functions.items():
+        if name.name_hint != "main":
+            break
+    features = auto_scheduler.feature.named_features_from_primfunc(func)
+    # featurization does not handle multiple-add right now, so they are split out
+    assert features["float_addsub"].sum() >= 128 * 128 * 128
+    assert features["float_mul"].sum() >= 128 * 128 * 128
+    total_bytes_loaded = 0
+    for i in range(0, 4):
+        total_bytes_loaded += features[f"B{i}.unique_bytes"].sum()
+    assert total_bytes_loaded > 2 * 128 * 128 * 4  # 4 bytes per float32
+
+
+@T.prim_func
+def negative_extent(A: T.Buffer((1,), "float32")):
+    for j in range(0, -1):
+        A[j] = A[j] + 1.0
+
+
+def test_negative_extent():
+    features = auto_scheduler.feature.named_features_from_primfunc(negative_extent)
+    assert features["B0.unique_bytes"] == 0
+
+
+@T.prim_func
+def zero_dim(
+    p2: T.Buffer((), "float32"),
+    T_cast: T.Buffer((T.int64(1), T.int64(768)), "int8"),
+):
+    # function attr dict
+    T.func_attr(
+        {
+            "tir.noalias": True,
+            "Primitive": 1,
+        }
+    )
+    # buffer definition
+    T_cast_1 = T.buffer_decl([T.int64(768)], dtype="int8", data=T_cast.data)
+    p2_1 = T.buffer_decl([1], dtype="float32", data=p2.data)
+    # body
+    for i0_i1_fused in T.serial(768):
+        T_cast_1[i0_i1_fused] = p2_1[0]
+
+
+def test_zero_dim():
+    features = auto_scheduler.feature.named_features_from_primfunc(zero_dim)
+    assert features["B1.stride"] == 1
+    assert features["B0.stride"] == 1
 
 
 if __name__ == "__main__":

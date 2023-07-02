@@ -82,20 +82,22 @@ struct VMFunction {
   /*! \brief The instructions representing the function. */
   std::vector<Instruction> instructions;
   /*! \brief The size of the frame for this function */
-  Index register_file_size;
-  /*! \brief The device type of each parameter for this function. */
-  std::vector<Index> params_device_type;
+  Index register_file_size = 0;
+  /*! \brief The indexes for the device holding each function parameter. */
+  std::vector<Index> param_device_indexes;
 
-  VMFunction(const std::string& name, std::vector<std::string> params,
-             const std::vector<Instruction>& instructions, Index register_file_size,
-             const std::vector<Index> params_device_type = {})
-      : name(name),
-        params(params),
-        instructions(instructions),
+  VMFunction(std::string name, std::vector<std::string> params,
+             std::vector<Instruction> instructions, Index register_file_size,
+             std::vector<Index> param_device_indexes)
+      : name(std::move(name)),
+        params(std::move(params)),
+        instructions(std::move(instructions)),
         register_file_size(register_file_size),
-        params_device_type(params_device_type) {}
+        param_device_indexes(std::move(param_device_indexes)) {
+    ICHECK_EQ(this->params.size(), this->param_device_indexes.size());
+  }
 
-  VMFunction() {}
+  VMFunction() = default;
 
   friend std::ostream& operator<<(std::ostream& os, const VMFunction&);
 };
@@ -143,7 +145,7 @@ struct VMFrame {
  * multiple threads, or serialize them to disk or over the
  * wire.
  */
-class VirtualMachine : public runtime::ModuleNode {
+class TVM_DLL VirtualMachine : public runtime::ModuleNode {
  public:
   /*!
    * \brief Get a PackedFunc from module.
@@ -162,7 +164,7 @@ class VirtualMachine : public runtime::ModuleNode {
    *   If the function needs resource from the module(e.g. late linking),
    *   it should capture sptr_to_self.
    */
-  virtual PackedFunc GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self);
+  virtual PackedFunc GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self);
 
   virtual ~VirtualMachine() {}
 
@@ -174,7 +176,10 @@ class VirtualMachine : public runtime::ModuleNode {
    * \brief load the executable for the virtual machine.
    * \param exec The executable.
    */
-  virtual void LoadExecutable(const Executable* exec);
+  virtual void LoadExecutable(const ObjectPtr<Executable>& exec);
+
+  /*! \brief Get the property of the runtime module .*/
+  int GetPropertyMask() const final { return ModulePropertyMask::kRunnable; }
 
  protected:
   /*! \brief Push a call frame on to the call stack. */
@@ -198,14 +203,14 @@ class VirtualMachine : public runtime::ModuleNode {
    * \param reg The register to read from.
    * \return The read object.
    */
-  inline ObjectRef ReadRegister(RegName reg) const;
+  ObjectRef ReadRegister(RegName reg) const;
 
   /*!
    * \brief Read a VM register and cast it to int32_t
    * \param reg The register to read from.
    * \return The read scalar.
    */
-  inline int64_t LoadScalarInt(RegName reg) const;
+  int64_t LoadScalarInt(RegName reg) const;
 
   /*!
    * \brief Invoke a VM function.
@@ -225,6 +230,16 @@ class VirtualMachine : public runtime::ModuleNode {
   ObjectRef Invoke(const std::string& name, const std::vector<ObjectRef>& args);
 
   /*!
+   * \brief Invoke a VM function.
+   * \param func The function.
+   * \param input_args The input arguments to the function.
+   * \param output_args The pre-allocated output arguments of the function.
+   * \return The object(s) representing the result.
+   */
+  ObjectRef Invoke(const VMFunction& func, const std::vector<ObjectRef>& input_args,
+                   const std::vector<ObjectRef>& output_args);
+
+  /*!
    * \brief Invoke a PackedFunction
    *
    * \param packed_index The offset of the PackedFunction in all functions.
@@ -239,17 +254,19 @@ class VirtualMachine : public runtime::ModuleNode {
                             Index output_size, const std::vector<ObjectRef>& args);
 
   /*!
-   * \brief Initialize the virtual machine for a set of devices.
-   * \param devices The set of TVM devices.
+   * \brief Initialize the virtual machine for a set of (physical) devices.
+   * \param physical_devices The set of TVM devices.
    * \param alloc_types The allocator types for each device.
    */
-  void Init(const std::vector<Device>& devices, const std::vector<AllocatorType>& alloc_types);
+  void Init(const std::vector<Device>& physical_devices,
+            const std::vector<AllocatorType>& alloc_types);
 
   /*! \brief Run VM dispatch loop. */
-  void RunLoop();
+  void RunLoop(const std::vector<Index>& output_tensor_reg_indices = {});
 
-  /*! \brief Get device from the device list based on a given device type. */
-  Device GetDevice(Index device_type) const;
+  /*! \brief Get device from the device list based on a given device index. */
+  Device GetDevice(Index device_index) const;
+  Allocator* GetAllocator(Index device_index) const;
 
   /*!
    * \brief Invoke a global setting up the VM state to execute.
@@ -257,6 +274,153 @@ class VirtualMachine : public runtime::ModuleNode {
    * This does not begin execution of the VM.
    */
   void InvokeGlobal(const VMFunction& func, const std::vector<ObjectRef>& args);
+
+  /*!
+   * \brief Set inputs to a function.
+   * \param name The function name
+   * \param args args[offset:] are arguments to the
+   * function. If the arguments are not of the correct device for the function,
+   * they will be copied to the device.
+   * \param offset Starting offset of the arguments in `args`.
+   */
+  void SetInput(std::string name, TVMArgs args, int offset);
+
+  /*!
+   * \brief Set one input tensor with index or name to a function.
+   * \param name The function name.
+   * \param tag index or name of the input tensor .
+   * \param tensor the input tensor. If the tensor is not of the correct device for the function,
+   * they will be copied to the device.
+   */
+  void SetOneInput(std::string name, const TVMArgValue& tag, const TVMArgValue& tensor);
+
+  /*!
+   * \brief Set pre-allocated output tensors to a function.
+   * It is native implementation of 'set_outputs' python method.
+   * It is used in scenario when output tensors are allocated outside each invocation.
+   * Note: it sets set_outputs_enabled_[name] true and fill outputs_[name]
+   * but after invocation the first is switched off and the second is cleared
+   * \param name The function name
+   * \param args outputs to the function.
+   */
+  void SetOutputs(std::string name, TVMArgs args);
+
+  /*!
+   * \brief Preparation part of Invoke method before RunLoop.
+   * \param func the function.
+   * \param args input args
+   */
+  void PrintInfoAndSetInputArgs(const VMFunction& func, const std::vector<ObjectRef>& args);
+
+  /*!
+   * \brief Set pre-allocated outputs to register for specified function.
+   * \param func_name The function's name.
+   * \param outputs set of output tensors.
+   */
+  void SetOutputTensorsToRegister(const std::string& func_name,
+                                  const std::vector<ObjectRef>& outputs);
+
+  /*!
+   * \brief Internal hook for profiling the start of an op.
+   *
+   * This hook is only called on certain ops that are likely to take a
+   * significant amount of runtime (normally because they alloc or transfer to
+   * device).
+   *
+   * \param instr Instruction that will be executed after this hook fires
+   */
+  virtual void OpStartHook(Instruction instr);
+
+  /*!
+   * \brief Internal hook for profiling the end of an op.
+   */
+  virtual void OpStopHook();
+
+ private:
+  /*!
+   * \brief Get index of input tensor from its name.
+   * \param func_name The function's name.
+   * \param input_name The input tensor name.
+   * \return The input tensor index.
+   */
+  int64_t GetInputIndexFromVMFunction(const std::string& func_name,
+                                      const std::string& input_name) const;
+
+  /*!
+   * \brief Get index of input tensor from its name.
+   * \param params parameter names.
+   * \param input_name The input tensor name.
+   * \return The input tensor index.
+   */
+  int64_t GetInputIndexFromName(const std::vector<std::string>& params,
+                                const std::string& input_name) const;
+
+  /*!
+   * \brief Check executable exists and get VM function from it.
+   * \param func_name The function's name.
+   * \return VM function.
+   */
+  const VMFunction& CheckAndGetVMFunction(const std::string& func_name) const;
+
+  /*!
+   * \brief Creats inputs_ field, if it exists check its size.
+   * \param func_name The function's name.
+   * \param size inputs_ field size.
+   */
+  void CreateInputsOrCheckSize(const std::string& func_name, size_t size);
+
+  /*!
+   * \brief Set one input tensor with given index to set of input tensors if need copy to given
+   * device. \param tensors the input tensors set (destination) \param tensor some tensor (not
+   * necessary DLTensor). \param index The input tensor index. \param dev device to copy if need.
+   */
+  void SetInputTensorWithIndex(std::vector<ObjectRef>& tensors,  // NOLINT(*)
+                               const TVMArgValue& tensor, int index, Device dev);
+
+  /*!
+   * \brief Convert tensor from TVMArgValue to ObjectRef.
+   * DLTensor and NDArray types are supported.
+   * \param tensor given arg value containing tensor.
+   * \return tensor in ObjectRef format
+   */
+  ObjectRef TensorFromTVMArgValueToObjectRef(const TVMArgValue& tensor) const;
+
+  /*!
+   * \brief Get index of outputs in register_file from func code
+   * \return result register index
+   */
+  Index GetResultRegisterIndex() const;
+
+  /*!
+   * \brief Calculate the index of operation which destination is result
+   * \param res_index is the index of op returning result
+   */
+  void CalculatePreResultOpIndex(Index res_index);
+
+  /*!
+   * \brief Get indices from register_file for output tensors.
+   * It helps to replace output tensors allocated in RunLoop by
+   * tensors pre-allocated outside. Scenario is when `set_output` is used
+   * \return indices from register_file for output tensors.
+   */
+  std::vector<Index> GetOutputTensorRegIndices();
+
+  /*!
+   * \brief Write new allocated tensor to register_file of frame.
+   * \param instr current instruction containing shape and storage info.
+   */
+  void WriteAllocatedTensor(const Instruction& instr);
+
+  /*!
+   * \brief 'set_outputs_enabled' is assumed true for using this method.
+   * It is expected that result register has already contained tensor from outside,
+   * new memory is not allocated and write, but expected shape and data type are checked.
+   * For other register WriteAllocatedTensor method is used.
+   * \param instr current instruction containing shape and storage info.
+   */
+  void WriteAllocatedTensorFromOutside(const Instruction& instr);
+
+  bool FindIndex(const std::vector<Index>& indices, Index val) const;
 
  protected:
   /*! \brief The virtual machine's packed function table. */
@@ -272,12 +436,24 @@ class VirtualMachine : public runtime::ModuleNode {
   /*! \brief The special return register. */
   ObjectRef return_register_;
   /*! \brief The executable the VM will operate on. */
-  const Executable* exec_;
+  ObjectPtr<Executable> exec_;
   /*! \brief The function name to inputs mapping. */
   std::unordered_map<std::string, std::vector<ObjectRef>> inputs_;
-  /*! \brief The set of TVM devices the VM is currently executing on. */
+  /*! \brief The function name to flag enabling scenario with set outputs. */
+  std::unordered_map<std::string, bool> set_outputs_enabled_;
+  /*! \brief The index of operation which destination is result. */
+  Index preresult_op_index_ = -1;
+  /*! \brief The function name to indices of output tensors in register file. */
+  std::unordered_map<std::string, std::vector<Index>> output_tensor_reg_indices_;
+  /*! \brief The function name to pre-allocated outputs mapping. */
+  std::unordered_map<std::string, std::vector<ObjectRef>> outputs_;
+  /*!
+   * \brief The "physical" devices the VM can execute primitives on. All "device indexes"
+   * are w.r.t. this vector. Each entry in this vector must match the corresponding entry
+   * in the executable's "virtual" devices vector.
+   */
   std::vector<Device> devices_;
-  /*! \brief The cached memory allocators. */
+  /*! \brief The cached memory allocators, one per device. */
   std::vector<Allocator*> allocators_;
   /*!
    * \brief The constant pool for runtime. It caches the device dependent

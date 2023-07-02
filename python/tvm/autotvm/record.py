@@ -20,11 +20,12 @@
 
 import argparse
 import base64
+from io import TextIOBase
 import logging
-import multiprocessing
 import pickle
 import json
 import time
+from typing import Union
 import os
 import itertools
 from collections import OrderedDict
@@ -32,6 +33,7 @@ import numpy as np
 
 from .. import build, lower
 from ..target import Target
+from ..contrib import popen_pool
 from .. import __version__
 from . import task
 from .task import ConfigEntity, ApplyHistoryBest
@@ -194,25 +196,47 @@ def decode(row, protocol="json"):
     raise RuntimeError("Invalid log protocol: " + protocol)
 
 
-def load_from_file(filename):
-    """Generator: load records from file.
+def load_from_buffer(file: TextIOBase):
+    """Generator: load records from buffer.
     This is a generator that yields the records.
 
     Parameters
     ----------
-    filename: str
+    file: io.TextIOBase
 
     Yields
     ------
     input: autotvm.measure.MeasureInput
     result: autotvm.measure.MeasureResult
     """
-    for row in open(filename):
+    for row in file:
         if row and not row.startswith("#"):
             ret = decode(row)
             if ret is None:
                 continue
             yield ret
+
+
+def load_from_file(filepath: Union[str, bytes, os.PathLike]):
+    """Generator: load records from path.
+    This is a generator that yields the records.
+
+    Parameters
+    ----------
+    filepath: str, bytes, or os.PathLike
+
+    Yields
+    ------
+    input: autotvm.measure.MeasureInput
+    result: autotvm.measure.MeasureResult
+    """
+    with open(filepath) as f:
+        for row in f:
+            if row and not row.startswith("#"):
+                ret = decode(row)
+                if ret is None:
+                    continue
+                yield ret
 
 
 def split_workload(in_file, clean=True):
@@ -230,7 +254,7 @@ def split_workload(in_file, clean=True):
     lines = list(open(in_file).readlines())
 
     logger.info("start converting...")
-    pool = multiprocessing.Pool()
+    pool = popen_pool.PopenPoolExecutor()
     lines = [rec for rec in pool.map(decode, lines) if rec is not None]
     logger.info("map done %.2f", time.time() - tic)
 
@@ -255,13 +279,13 @@ def split_workload(in_file, clean=True):
 
             # write to file
             logger.info("Key: %s\tValid: %d\tDup: %d\t", k, len(cleaned), len(v) - len(cleaned))
-            with open(args.i + ".%03d.wkl" % i, "w") as fout:
+            with open(args.i + f".{i:03d}.wkl", "w") as fout:
                 for inp, res in cleaned:
                     fout.write(encode(inp, res) + "\n")
     else:
         for i, (k, v) in enumerate(wkl_dict.items()):
             logger.info("Key: %s\tNum: %d", k, len(v))
-            with open(args.i + ".%03d.wkl" % i, "w") as fout:
+            with open(args.i + f".{i:03d}.wkl", "w") as fout:
                 for inp, res in v:
                     fout.write(encode(inp, res) + "\n")
 

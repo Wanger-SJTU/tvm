@@ -48,14 +48,22 @@ def _batch_matmul_legalize(attrs, inputs, arg_types):
     x_tensor, y_tensor = arg_types[0], arg_types[1]
     dtype = x_tensor.dtype
 
+    if attrs.transpose_a:
+        B, K, M = x_tensor.shape
+    else:
+        B, M, K = x_tensor.shape
+
+    if attrs.transpose_b:
+        B, N, K = y_tensor.shape
+    else:
+        B, K, N = y_tensor.shape
+
     # Collect the output tensor.
     output_tensor = arg_types[2]
 
     # Collect the input exprs.
     x, y = inputs
 
-    B, M, K = x_tensor.shape
-    B, N, K = y_tensor.shape
     if (
         isinstance(B, tir.expr.Any)
         or isinstance(M, tir.expr.Any)
@@ -96,9 +104,23 @@ def _batch_matmul_legalize(attrs, inputs, arg_types):
         return None
 
     logger.info("batch_matmul pad_to_tensorcore, extra_flops %s", extra_flops)
-    x_ = relay.nn.pad(x, pad_width=((0, 0), (0, dm), (0, dk))) if dm or dk else x
-    y_ = relay.nn.pad(y, pad_width=((0, 0), (0, dn), (0, dk))) if dn or dk else y
-    out_ = relay.nn.batch_matmul(x_, y_, attrs.out_dtype)
+
+    if attrs.transpose_a:
+        pad_width = ((0, 0), (0, dk), (0, dm))
+    else:
+        pad_width = ((0, 0), (0, dm), (0, dk))
+
+    x_ = relay.nn.pad(x, pad_width=pad_width) if dm or dk else x
+
+    if attrs.transpose_b:
+        pad_width = ((0, 0), (0, dn), (0, dk))
+    else:
+        pad_width = ((0, 0), (0, dk), (0, dn))
+
+    y_ = relay.nn.pad(y, pad_width=pad_width) if dn or dk else y
+
+    out_ = relay.nn.batch_matmul(x_, y_, **attrs)
+
     out = (
         relay.strided_slice(out_, begin=[0, 0, 0], end=[x.value for x in output_tensor.shape])
         if dm or dn
@@ -167,8 +189,22 @@ def _dense_legalize(attrs, inputs, arg_types):
         return None
 
     (dm, dk, dn), extra_flops_ratio = pad_to_tensorcore(M, K, N, candidates)
+    skip_pad = extra_flops_ratio > 2
 
-    if extra_flops_ratio > 2:
+    if skip_pad and dtype in ["int8", "uint8"]:
+        skip_pad = False
+        # If tensorcore schedule padding fails, pad to nearest upward 4x4x4 as long as
+        # the additional flops ratio isn't double or more.
+        # Note that 4x4x4 is invalid for tensorcore scheduling, but padding upwards to 4x4x4
+        # doesn't hurt if tensorcore padding has already failed.
+        if M % 4 == 0 and K % 4 == 0 and N % 4 == 0:
+            # No need to pad
+            return None
+        (dm, dk, dn) = _pad_to(M, K, N, (4, 4, 4))
+        extra_flops_ratio = _extra_flops(M, K, N, dm, dk, dn) / (M * K * N)
+        skip_pad = extra_flops_ratio > 2
+
+    if skip_pad:
         logger.info("dense pad_to_tensorcore skipped, extra_flops_ratio %s", extra_flops_ratio)
         return None
 
@@ -176,6 +212,12 @@ def _dense_legalize(attrs, inputs, arg_types):
 
     x_ = relay.nn.pad(x, pad_width=((0, dm), (0, dk))) if dm or dk else x
     y_ = relay.nn.pad(y, pad_width=((0, dn), (0, dk))) if dn or dk else y
+
+    # If units is explicitly specified, it is used to compute the output shape.
+    # We need to update units after padding to prevent a type error.
+    if attrs["units"] is not None:
+        new_attrs["units"] = N + dn
+
     out_ = relay.nn.dense(x_, y_, **new_attrs)
     out = (
         relay.strided_slice(out_, begin=[0, 0], end=[x.value for x in output_tensor.shape])
@@ -192,12 +234,16 @@ def pad_to_tensorcore(M, K, N, candidates):
     best_pad = (0, 0, 0)
     for padding in candidates:
         dm, dk, dn = _pad_to(M, K, N, padding)
-        e = (M + dm) * (N + dn) * (K + dk) - M * N * K
+        e = _extra_flops(M, K, N, dm, dk, dn)
         # print(dm, dk, dn, e, flops)
         if e < extra_flops:
             extra_flops = e
             best_pad = (dm, dk, dn)
     return best_pad, extra_flops / flops
+
+
+def _extra_flops(M, K, N, dm, dk, dn):
+    return (M + dm) * (N + dn) * (K + dk) - M * N * K
 
 
 def _pad_to(M, K, N, PADDING):

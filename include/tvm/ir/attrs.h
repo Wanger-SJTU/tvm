@@ -67,13 +67,13 @@ namespace tvm {
   static constexpr const char* _type_key = TypeKey;              \
   TVM_DECLARE_FINAL_OBJECT_INFO(ClassName, ::tvm::BaseAttrsNode) \
   template <typename FVisit>                                     \
-  void __VisitAttrs__(FVisit& __fvisit__)  // NOLINT(*)
+  void _tvm_VisitAttrs(FVisit& _tvm_fvisit)  // NOLINT(*)
 
 /*!
  * \brief Declare an attribute field.
  * \param FieldName The field name.
  */
-#define TVM_ATTR_FIELD(FieldName) __fvisit__(#FieldName, &FieldName)
+#define TVM_ATTR_FIELD(FieldName) _tvm_fvisit(#FieldName, &FieldName)
 
 /*!
  * \brief Create a NodeRef type that represents null.
@@ -214,6 +214,7 @@ class DictAttrsNode : public BaseAttrsNode {
   void VisitNonDefaultAttrs(AttrVisitor* v) final;
   void InitByPackedArgs(const runtime::TVMArgs& args, bool allow_unknown) final;
   Array<AttrFieldInfo> ListFieldInfo() const final;
+
   // type info
   static constexpr const char* _type_key = "DictAttrs";
   TVM_DECLARE_FINAL_OBJECT_INFO(DictAttrsNode, BaseAttrsNode);
@@ -228,9 +229,74 @@ class DictAttrs : public Attrs {
   /*!
    * \brief Consruct a Attrs backed by DictAttrsNode.
    * \param dict The attributes.
-   * \return The dict attributes.
    */
   TVM_DLL explicit DictAttrs(Map<String, ObjectRef> dict);
+
+  // Utils for accessing attributes
+  // This needs to be on DictAttrs, not DictAttrsNode because we return the default
+  // value if DictAttrsNode is not defined.
+  /*!
+   * \brief Get a function attribute.
+   *
+   * \param attr_key The attribute key.
+   * \param default_value The default value if the key does not exist, defaults to nullptr.
+   *
+   * \return The result
+   *
+   * \tparam TOBjectRef the expected object type.
+   * \throw Error if the key exists but the value does not match TObjectRef
+   *
+   * \code
+   *
+   *  void GetAttrExample(const BaseFunc& f) {
+   *    auto value = f->attrs.GetAttr<Integer>("AttrKey", 0);
+   *  }
+   *
+   * \endcode
+   */
+  template <typename TObjectRef>
+  Optional<TObjectRef> GetAttr(
+      const std::string& attr_key,
+      Optional<TObjectRef> default_value = Optional<TObjectRef>(nullptr)) const {
+    static_assert(std::is_base_of<ObjectRef, TObjectRef>::value,
+                  "Can only call GetAttr with ObjectRef types.");
+    if (!defined()) return default_value;
+    const DictAttrsNode* node = this->as<DictAttrsNode>();
+
+    auto it = node->dict.find(attr_key);
+    if (it != node->dict.end()) {
+      return Downcast<Optional<TObjectRef>>((*it).second);
+    } else {
+      return default_value;
+    }
+  }
+  // variant that uses TObjectRef to enable implicit conversion to default value.
+  template <typename TObjectRef>
+  Optional<TObjectRef> GetAttr(const std::string& attr_key, TObjectRef default_value) const {
+    return GetAttr<TObjectRef>(attr_key, Optional<TObjectRef>(default_value));
+  }
+  /*!
+   * \brief Check whether the function has an non-zero integer attr.
+   *
+   * This function can be used to check whether an optional
+   * attribute mark(e.g. inline) exists.
+   *
+   * \param attr_key The key to the attribute.
+   * \return The check result.
+   *
+   * \code
+   *
+   *  void HasNonzeroAttrExample(const BaseFunc& f) {
+   *    if (f->HasNonzeroAttr(attr::kInline)) {
+   *      // inline the function.
+   *    }
+   *  }
+   *
+   * \endcode
+   */
+  bool HasNonzeroAttr(const std::string& attr_key) const {
+    return GetAttr<Integer>(attr_key, 0).value_or(0).IntValue() != 0;
+  }
 
   TVM_DEFINE_OBJECT_REF_METHODS(DictAttrs, Attrs, DictAttrsNode);
   TVM_DEFINE_OBJECT_REF_COW_METHOD(DictAttrsNode);
@@ -247,6 +313,113 @@ inline TAttrs AttrsWithDefaultValues() {
   auto n = make_object<typename TAttrs::ContainerType>();
   n->InitByPackedArgs(runtime::TVMArgs(nullptr, nullptr, 0), false);
   return TAttrs(n);
+}
+
+/*!
+ * \brief Copy the function or module, but overrides
+ *        the attribute value key with the value.
+ *
+ * \param input The thing to annotate (BaseFunc or IRModule)
+ * \param attr_key The attribute key.
+ * \param attr_value The value attribute value.
+ *
+ * \tparam TFunc The corresponding function or module type.
+ *
+ * \returns The new function or module with updated attributes.
+ *
+ * \note This function performs copy on write optimization for func and module.
+ *       If we move a uniquely referenced func or module into WithAttr,
+ *       then no additional copy will be performed.
+ *
+ *       This is also why we make it as a function instead of a member function
+ *       and why we pass by value in the first argument.
+ *
+ * \code
+ *
+ *  // Recommended way to trigger copy on write
+ *  func = WithAttr(std::move(func), "key1", value1);
+ *  func = WithAttr(std::move(func), "key2", value2);
+ *
+ * \endcode
+ */
+template <typename TFunc>
+inline TFunc WithAttr(TFunc input, const std::string& attr_key, ObjectRef attr_value) {
+  using TNode = typename TFunc::ContainerType;
+  static_assert(TNode::_type_final, "Can only operate on the leaf nodes");
+  TNode* node = input.CopyOnWrite();
+  if (node->attrs.defined()) {
+    node->attrs.CopyOnWrite()->dict.Set(attr_key, attr_value);
+  } else {
+    Map<String, ObjectRef> dict = {{attr_key, attr_value}};
+    node->attrs = DictAttrs(dict);
+  }
+  return input;
+}
+
+/*!
+ * \brief Copy the function or module, but overrides the attributes with the entries from \p attrs.
+ *
+ * \param input The thing to annotate (BaseFunc or IRModule)
+ * \param attrs Key/values attributes to add to \p input.
+ *
+ * \tparam TFunc The corresponding function or module type.
+ *
+ * \returns The new function or module with updated attributes.
+ */
+template <typename TFunc>
+inline TFunc WithAttrs(TFunc input, Map<String, ObjectRef> attrs) {
+  using TNode = typename TFunc::ContainerType;
+  static_assert(TNode::_type_final, "Can only operate on the leaf nodes");
+  TNode* node = input.CopyOnWrite();
+  if (node->attrs.defined()) {
+    for (const auto& pair : attrs) {
+      node->attrs.CopyOnWrite()->dict.Set(pair.first, pair.second);
+    }
+  } else {
+    node->attrs = DictAttrs(std::move(attrs));
+  }
+  return input;
+}
+
+/*!
+ * \brief Copy the function or module, but removes the specified
+ *        attribute.
+ *
+ * \param input The thing to annotate (BaseFunc or IRModule)
+ * \param attr_key The attribute key.
+ *
+ * \tparam TFunc The corresponding function or module type.
+ *
+ * \returns The new function or module with removed attribute.
+ *
+ * \note This function performs copy on write optimization for func and module.
+ *       If we move a uniquely referenced func or module into WithoutAttr,
+ *       then no additional copy will be performed.
+ *
+ *       This is also why we make it as a function instead of a member function
+ *       and why we pass by value in the first argument.
+ *
+ * \code
+ *
+ *  // Recommended way to trigger copy on write
+ *  func = WithoutAttr(std::move(func), "key1");
+ *  func = WithoutAttr(std::move(func), "key2");
+ *
+ * \endcode
+ */
+template <typename TFunc>
+inline TFunc WithoutAttr(TFunc input, const std::string& attr_key) {
+  using TNode = typename TFunc::ContainerType;
+  static_assert(TNode::_type_final, "Can only operate on the leaf nodes");
+
+  if (input->attrs.defined()) {
+    TNode* node = input.CopyOnWrite();
+    node->attrs.CopyOnWrite()->dict.erase(attr_key);
+    if (node->attrs->dict.size() == 0) {
+      node->attrs = NullValue<DictAttrs>();
+    }
+  }
+  return input;
 }
 
 // Namespace containing detail implementations
@@ -356,7 +529,7 @@ struct AttrInitEntry {
   ~AttrInitEntry() DMLC_THROW_EXCEPTION {
     if (value_missing_) {
       std::ostringstream os;
-      os << type_key_ << ": Cannot find required field \'" << key_ << "\' during initialization."
+      os << type_key_ << ": Cannot find required field \'" << key_ << "\' during initialization. "
          << "If the key is defined check that its type matches the declared type.";
       throw AttrError(os.str());
     }
@@ -661,19 +834,19 @@ class AttrsNode : public BaseAttrsNode {
  public:
   void VisitAttrs(AttrVisitor* v) {
     ::tvm::detail::AttrNormalVisitor vis(v);
-    self()->__VisitAttrs__(vis);
+    self()->_tvm_VisitAttrs(vis);
   }
 
   void VisitNonDefaultAttrs(AttrVisitor* v) {
     ::tvm::detail::AttrNonDefaultVisitor vis(v);
-    self()->__VisitAttrs__(vis);
+    self()->_tvm_VisitAttrs(vis);
   }
 
   void InitByPackedArgs(const runtime::TVMArgs& args, bool allow_unknown) final {
     ICHECK_EQ(args.size() % 2, 0);
     const int kLinearSearchBound = 16;
     int hit_count = 0;
-    // applies two stratgies to lookup
+    // applies two strategies to lookup
     if (args.size() < kLinearSearchBound) {
       // linear search.
       auto ffind = [&args](const char* key, runtime::TVMArgValue* val) {
@@ -687,7 +860,7 @@ class AttrsNode : public BaseAttrsNode {
         return false;
       };
       auto vis = ::tvm::detail::CreateInitVisitor(DerivedType::_type_key, ffind);
-      self()->__VisitAttrs__(vis);
+      self()->_tvm_VisitAttrs(vis);
       hit_count = vis.hit_count_;
     } else {
       // construct a map then do lookup.
@@ -705,7 +878,7 @@ class AttrsNode : public BaseAttrsNode {
         return false;
       };
       auto vis = ::tvm::detail::CreateInitVisitor(DerivedType::_type_key, ffind);
-      self()->__VisitAttrs__(vis);
+      self()->_tvm_VisitAttrs(vis);
       hit_count = vis.hit_count_;
     }
     // error handling, slow path
@@ -713,7 +886,7 @@ class AttrsNode : public BaseAttrsNode {
       for (int i = 0; i < args.size(); i += 2) {
         ::tvm::detail::AttrExistVisitor visitor;
         visitor.key_ = args[i].operator std::string();
-        self()->__VisitAttrs__(visitor);
+        self()->_tvm_VisitAttrs(visitor);
         if (!visitor.exist_) {
           std::ostringstream os;
           os << DerivedType::_type_key << ": does not have field \'" << visitor.key_
@@ -729,18 +902,18 @@ class AttrsNode : public BaseAttrsNode {
   bool SEqualReduce(const DerivedType* other, SEqualReducer equal) const {
     DerivedType* pself = self();
     ::tvm::detail::AttrsSEqualVisitor visitor(pself, other, equal);
-    self()->__VisitAttrs__(visitor);
+    self()->_tvm_VisitAttrs(visitor);
     return visitor.result_;
   }
 
   void SHashReduce(SHashReducer hash_reducer) const {
     ::tvm::detail::AttrsSHashVisitor visitor(hash_reducer);
-    self()->__VisitAttrs__(visitor);
+    self()->_tvm_VisitAttrs(visitor);
   }
 
   Array<AttrFieldInfo> ListFieldInfo() const final {
     ::tvm::detail::AttrDocVisitor visitor;
-    self()->__VisitAttrs__(visitor);
+    self()->_tvm_VisitAttrs(visitor);
     return visitor.fields_;
   }
 

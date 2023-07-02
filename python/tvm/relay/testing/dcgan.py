@@ -27,6 +27,7 @@ Radford, Alec, Luke Metz, and Soumith Chintala.
 arXiv preprint arXiv:1511.06434 (2015).
 """
 from tvm import relay
+
 from . import layers
 from .init import create_workload
 
@@ -41,7 +42,7 @@ def deconv2d(data, ishape, oshape, kshape, layout, name, stride=(2, 2)):
     adj_x = (target_shape[1] + 2 * pad_x - kshape[1]) % stride[1]
 
     if layout == "NCHW":
-        kernel_layout = "OIHW"
+        kernel_layout = "IOHW"
     elif layout == "NHWC":
         kernel_layout = "HWOI"
     else:
@@ -64,10 +65,10 @@ def deconv2d(data, ishape, oshape, kshape, layout, name, stride=(2, 2)):
 def deconv2d_bn_relu(data, prefix, **kwargs):
     """a block of deconv + batch norm + relu"""
     eps = 1e-5 + 1e-12
-    net = deconv2d(data, name="%s_deconv" % prefix, **kwargs)
+    net = deconv2d(data, name=f"{prefix}_deconv", **kwargs)
     bn_axis = kwargs.get("layout", "NCHW").index("C")
     net = layers.batch_norm_infer(
-        net, epsilon=eps, scale=False, axis=bn_axis, name="%s_batch_norm" % prefix
+        net, epsilon=eps, scale=False, axis=bn_axis, name=f"{prefix}_batch_norm"
     )
     net = relay.nn.relu(net)
     return net

@@ -156,6 +156,18 @@ TEST(PackedFunc, Type) {
   ICHECK(get_type2("float32x2").operator DataType() == DataType::Float(32, 2));
 }
 
+TEST(PackedFunc, AsTVMRetValue) {
+  using namespace tvm;
+  using namespace tvm::runtime;
+  ObjectRef obj = PackedFunc([](TVMArgs args, TVMRetValue* rv) {
+    PrimExpr x = args[0];
+    *rv = x.as<tvm::tir::IntImmNode>()->value + 1;
+  });
+  TVMRetValue value;
+  value = obj;
+  ICHECK_EQ(value.operator PackedFunc()(1).operator int(), 2);
+}
+
 TEST(TypedPackedFunc, HighOrder) {
   using namespace tvm;
   using namespace tvm::runtime;
@@ -185,9 +197,10 @@ TEST(TypedPackedFunc, Deduce) {
   auto f = [](int x) -> int { return x + 1; };
   std::function<void(float)> y;
 
-  static_assert(std::is_same<function_signature<decltype(x)>::FType, int(float)>::value,
-                "invariant1");
-  static_assert(std::is_same<function_signature<decltype(f)>::FType, int(int)>::value,
+  static_assert(
+      std::is_same<function_signature<decltype(x)>::FType, int(float)>::value,  // NOLINT(*)
+      "invariant1");
+  static_assert(std::is_same<function_signature<decltype(f)>::FType, int(int)>::value,  // NOLINT(*)
                 "invariant2");
   static_assert(std::is_same<function_signature<decltype(y)>::FType, void(float)>::value,
                 "invariant3");
@@ -305,10 +318,4 @@ TEST(TypedPackedFunc, RValue) {
     // auto conversion.
     tf(1, true);
   }
-}
-
-int main(int argc, char** argv) {
-  testing::InitGoogleTest(&argc, argv);
-  testing::FLAGS_gtest_death_test_style = "threadsafe";
-  return RUN_ALL_TESTS();
 }

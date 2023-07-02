@@ -24,29 +24,30 @@ namespace tir {
 String ScheduleError::RenderReport(const String& primitive) const {
   IRModule mod = this->mod();
   std::ostringstream os;
-  os << "ScheduleError: An error occurred in the schedule primitive '" << primitive
-     << "'.\n\nThe IR is:\n"
-     << AsTVMScript(mod);
+
+  // get locations of interest
   Array<ObjectRef> locs = LocationsOfInterest();
+  std::unordered_map<ObjectRef, String, ObjectPtrHash, ObjectPtrEqual> loc_obj_to_name;
   int n_locs = locs.size();
-  std::vector<String> roi_names;
-  roi_names.reserve(n_locs);
-  if (n_locs > 0) {
-    os << "Regions of interest:\n";
-    for (const ObjectRef& obj : locs) {
-      String name = obj->GetTypeKey() + '#' + std::to_string(roi_names.size());
-      os << name << "\n" << obj;
-      roi_names.emplace_back(std::move(name));
-    }
-    os << "\n";
-  }
   std::string msg = DetailRenderTemplate();
-  for (int i = 0; i < n_locs; ++i) {
-    std::string src = "{" + std::to_string(i) + "}";
-    for (size_t pos; (pos = msg.find(src)) != std::string::npos;) {
-      msg.replace(pos, src.length(), roi_names[i]);
+  PrinterConfig cfg;
+  cfg->syntax_sugar = false;
+  if (n_locs > 0) {
+    for (int i = 0; i < n_locs; ++i) {
+      std::string name = locs[i]->GetTypeKey() + '#' + std::to_string(i);
+      std::string src = "{" + std::to_string(i) + "}";
+      for (size_t pos; (pos = msg.find(src)) != std::string::npos;) {
+        msg.replace(pos, src.length(), name);
+      }
+      cfg->obj_to_annotate.Set(locs[i], name);
+      cfg->obj_to_underline.push_back(locs[i]);
     }
   }
+  os << "ScheduleError: An error occurred in the schedule primitive '" << primitive
+     << "'.\n\nThe IR with diagnostic is:\n"
+     << TVMScriptPrinter::Script(mod, cfg) << std::endl;
+
+  // print error message
   os << "Error message: " << msg;
   return os.str();
 }

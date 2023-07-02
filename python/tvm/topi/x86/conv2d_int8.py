@@ -19,21 +19,30 @@
 """Conv2D int8 schedule on x86"""
 
 import tvm
-from tvm import te
-from tvm import autotvm
-from ..nn.conv2d import _get_workload as _get_conv2d_workload
-from .. import tag
+from tvm import autotvm, te
+from tvm.target.x86 import target_has_sse42
+
+from .. import nn, tag
 from ..generic import conv2d as conv2d_generic
-from ..nn.utils import get_pad_tuple
+from ..nn.conv2d import _get_workload as _get_conv2d_workload
 from ..nn.conv2d import unpack_NCHWc_to_nchw
 from ..nn.depthwise_conv2d import _get_workload as _get_depthwise_conv2d_workload
+from ..nn.utils import get_pad_tuple
 from ..utils import get_const_tuple, traverse_inline
-from .. import nn
 from . import conv2d_avx_1x1, conv2d_avx_common
 
 
 def _get_default_config_int8(
-    cfg, data, kernel, strides, padding, dilation, out_dtype, is_depthwise=False, layout="NCHW"
+    cfg,
+    data,
+    kernel,
+    strides,
+    padding,
+    dilation,
+    out_dtype,
+    is_depthwise=False,
+    layout="NCHW",
+    int32_lanes=4,
 ):
     """
     Get default schedule config for the workload
@@ -49,11 +58,11 @@ def _get_default_config_int8(
         is_kernel_1x1 = wkl.kernel_h == 1 and wkl.kernel_w == 1
         if is_kernel_1x1:
             conv2d_generic.fallback_schedule_cpu_1x1_int8(
-                cfg, wkl, int32_lanes=16, num_int8_elements=4
+                cfg, wkl, int32_lanes=int32_lanes, num_int8_elements=4
             )
         else:
             conv2d_generic.fallback_schedule_cpu_common_int8(
-                cfg, wkl, int32_lanes=16, num_int8_elements=4
+                cfg, wkl, int32_lanes=int32_lanes, num_int8_elements=4
             )
 
 
@@ -73,9 +82,7 @@ def is_int8_hw_support(data_dtype, kernel_dtype):
 
     # 3) Check target
     mcpu = tvm.target.Target.current().mcpu
-    is_target_support = False
-    if mcpu in ("skylake-avx512", "cascadelake"):
-        is_target_support = True
+    is_target_support = target_has_sse42(mcpu)
 
     return is_dtype_support and is_llvm_support and is_target_support
 
@@ -112,7 +119,7 @@ def _pack_data(cfg, data, kernel):
     kernel = te.compute(
         (oc_chunk, ic_chunk, kh, kw, ic_bn // n_elems, oc_bn, n_elems),
         lambda occ, icc, k_h, k_w, icbc, ocb, icbb: kernel[
-            occ * oc_bn + ocb, icc * ic_bn + icbc * ic_bn // n_elems + icbb, k_h, k_w
+            occ * oc_bn + ocb, icc * ic_bn + icbc * n_elems + icbb, k_h, k_w
         ],
         name="kernel_vec",
     )
@@ -164,6 +171,7 @@ def conv2d_NCHWc_int8(cfg, data, kernel, strides, padding, dilation, layout, out
             padding,
             dilation,
             out_dtype,
+            int32_lanes=16,
         )
 
     # Pack data if raw 4-D data is provided.
@@ -242,11 +250,11 @@ def schedule_conv2d_nhwc_pack_int8(cfg, outs):
                 if kh == 1 and kw == 1:
                     conv2d_avx_1x1._schedule_conv_nhwc_pack_int8(*args)
                 else:
-                    raise ValueError("Only support 1x1 kernel with " "schedule_conv2d_nhwc_pack.")
+                    raise ValueError("Only support 1x1 kernel with schedule_conv2d_nhwc_pack.")
             else:
                 raise ValueError(
-                    "Not support this data type {} with "
-                    "schedule_conv2d_nhwc_pack. Only support int8".format(data.dtype)
+                    f"Not support this data type {data.dtype} with "
+                    f"schedule_conv2d_nhwc_pack. Only support int8"
                 )
 
         scheduled_ops.append(op)

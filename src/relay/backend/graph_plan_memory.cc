@@ -24,59 +24,41 @@
  */
 #include <tvm/relay/analysis.h>
 #include <tvm/relay/attrs/annotation.h>
+#include <tvm/relay/attrs/call.h>
 #include <tvm/relay/expr.h>
 #include <tvm/relay/expr_functor.h>
 #include <tvm/relay/transform.h>
+#include <tvm/runtime/container/array.h>
 #include <tvm/tir/op.h>
 
+#include "../../runtime/texture.h"
 #include "../../support/arena.h"
+#include "../op/annotation/annotation.h"
+#include "../op/call/call.h"
+#include "../op/memory/memory.h"
+#include "../transforms/device_aware_visitors.h"
+#include "./token_allocator.h"
 #include "./utils.h"
 
 namespace tvm {
 namespace relay {
 
+using TargetsMap = Map<Integer, Target>;
+using Texture2DShape = runtime::Texture2DShape<int64_t>;
+constexpr auto Is2DStorage = runtime::IsTextureStorage;
+
 using backend::StaticMemoryPlan;
 using backend::StorageInfo;
 using IntegerArray = Array<Integer>;
 
-struct StorageToken {
-  /*! \brief Reference counter */
-  int ref_counter{0};
-  /*! \brief number of bytes */
-  size_t max_bytes{0};
-  /*! \brief The corresponding tensor type node. */
-  const TensorTypeNode* ttype{nullptr};
-  /*! \brief virtual device index that corresponds to the device_type in
-   * DLDevice. */
-  int device_type{0};
-  /*! \brief The storage id */
-  int64_t storage_id{-1};
-};
-
-std::ostream& operator<<(std::ostream& os, StorageToken tok) {
-  return os << "StorageToken: " << std::endl
-            << "ref_counter: " << tok.ref_counter << std::endl
-            << "max_bytes: " << tok.max_bytes << std::endl
-            << "tttype: " << tok.ttype
-            << std::endl
-            // ok idk how to print this properly
-            << "tttype shape: " << tok.ttype->shape << std::endl
-            << "device_type: " << tok.device_type << std::endl
-            << "storage_id: " << tok.storage_id << std::endl;
-}
-
-class StorageAllocaBaseVisitor : public ExprVisitor {
+class StorageAllocaBaseVisitor : public transform::DeviceAwareExprVisitor {
  public:
-  // run the visitor on a function.
-  void Run(const Function& func) {
-    for (Var param : func->params) {
-      CreateToken(param.operator->(), false);
-    }
-    // must always keep output alive.
-    for (StorageToken* tok : GetToken(func->body)) {
-      tok->ref_counter += 1;
-    }
-  }
+  StorageAllocaBaseVisitor() : transform::DeviceAwareExprVisitor(Optional<IRModule>()) {}
+
+  // run the visitor on a global function.
+  void Run(const Function& func) { VisitExpr(func); }
+
+  using transform::DeviceAwareExprVisitor::VisitExpr_;
 
   void VisitExpr_(const ConstantNode* op) final { this->CreateToken(op, false); }
 
@@ -84,8 +66,22 @@ class StorageAllocaBaseVisitor : public ExprVisitor {
     // Do nothing.
   }
 
-  void VisitExpr_(const FunctionNode* op) final {
-    // do not recurse into sub function.
+  void DeviceAwareVisitExpr_(const FunctionNode* func_node) final {
+    if (function_nesting() > 1) {
+      // do not recurse into sub functions.
+      return;
+    }
+    if (func_node->HasNonzeroAttr(attr::kPrimitive)) {
+      // No storage needed for primitive functions.
+      return;
+    }
+    for (const auto& param : func_node->params) {
+      CreateToken(param.get(), /*can_realloc=*/false);
+    }
+    // Process the function body, and make sure all result tokens are considered 'alive'.
+    for (StorageToken* tok : GetToken(func_node->body)) {
+      tok->ref_counter += 1;
+    }
   }
 
   void VisitExpr_(const GlobalVarNode* op) final {
@@ -113,15 +109,19 @@ class StorageAllocaBaseVisitor : public ExprVisitor {
 
   void VisitExpr_(const IfNode* op) final { LOG(FATAL) << "if is not supported."; }
 
-  void VisitExpr_(const LetNode* op) final {
-    auto token = GetToken(op->value);
-    token_map_[op->var.operator->()] = token;
-    token_map_[op] = GetToken(op->body);
+  void PreVisitLetBinding_(const Var& var, const Expr& value) final {
+    token_map_[var.get()] = GetToken(value);
+  }
+
+  void PostVisitLet_(const LetNode* let_node) final {
+    token_map_[let_node] = GetToken(let_node->body);
   }
 
  protected:
   /*! \brief internal token map */
-  std::unordered_map<const ExprNode*, std::vector<StorageToken*> > token_map_;
+  std::unordered_map<const ExprNode*, std::vector<StorageToken*>> token_map_;
+  /*! \brief empty token map */
+  const std::vector<StorageToken*> no_tokens_;
 
   /*!
    * \brief Get the necessary token.
@@ -130,27 +130,44 @@ class StorageAllocaBaseVisitor : public ExprVisitor {
    */
   const std::vector<StorageToken*>& GetToken(const Expr& expr) {
     this->VisitExpr(expr);
-    auto it = token_map_.find(expr.operator->());
-    ICHECK(it != token_map_.end())
-        << "Expression: `" << PrettyPrint(expr) << "` not found in storage map.";
+    // See through on_device calls.
+    Expr real_expr = IgnoreOnDevice(expr);
+
+    // Functions don't require data storage, represented by the empty token
+    if (real_expr->checked_type().as<FuncTypeNode>()) {
+      return no_tokens_;
+    }
+    this->VisitExpr(real_expr);
+    auto it = token_map_.find(real_expr.get());
+    ICHECK(it != token_map_.end()) << "Expression not found in storage map:" << std::endl
+                                   << PrettyPrint(real_expr);
     return it->second;
   }
+
   /*!
-   * \brief Populate the token map to set op's tokens
-   * \param op The node to be processed.
-   * \param can_realloc Whether we can re-allocate the memory.
+   * \brief Allocates (or reuses if \p can_realloc is true) a storage token for holding
+   * the result of evaluating \p op.
    */
-  virtual void CreateToken(const ExprNode* op, bool can_realloc) = 0;
+  void CreateToken(const ExprNode* expr_node, bool can_realloc) {
+    return CreateTokenOnDevice(expr_node, GetVirtualDevice(GetRef<Expr>(expr_node)), can_realloc);
+  }
+
+  /*!
+   * \brief Allocates (or reuses if \p can_realloc is true) a storage token for holding
+   * the result of evaluating \p op on \p device_type.
+   */
+  virtual void CreateTokenOnDevice(const ExprNode* op, const VirtualDevice& virtual_device,
+                                   bool can_realloc) = 0;
 };
 
+/*! \brief Associate storage with every expression without any concern for sharing. */
 class StorageAllocaInit : protected StorageAllocaBaseVisitor {
  public:
   explicit StorageAllocaInit(support::Arena* arena) : arena_(arena) {}
 
   /*! \return The internal token map */
-  std::unordered_map<const ExprNode*, std::vector<StorageToken*> > GetInitTokenMap(
+  std::unordered_map<const ExprNode*, std::vector<StorageToken*>> GetInitTokenMap(
       const Function& func) {
-    node_device_map_ = CollectDeviceInfo(func);
     this->Run(func);
     return std::move(token_map_);
   }
@@ -158,37 +175,27 @@ class StorageAllocaInit : protected StorageAllocaBaseVisitor {
  protected:
   using StorageAllocaBaseVisitor::VisitExpr_;
 
-  void CreateToken(const ExprNode* op, bool can_realloc) final {
+  void CreateTokenOnDevice(const ExprNode* op, const VirtualDevice& virtual_device,
+                           bool can_realloc) override {
     ICHECK(!token_map_.count(op));
     std::vector<StorageToken*> tokens;
-    int device_type =
-        node_device_map_.count(GetRef<Expr>(op)) ? node_device_map_[GetRef<Expr>(op)]->value : 0;
-    if (const auto* tuple_type = op->checked_type().as<TupleTypeNode>()) {
-      for (Type t : tuple_type->fields) {
-        const auto* ttype = t.as<TensorTypeNode>();
-        ICHECK(ttype);
-        StorageToken* token = arena_->make<StorageToken>();
-        token->ttype = ttype;
-        token->device_type = device_type;
-        tokens.push_back(token);
-      }
-    } else {
-      const auto* ttype = op->checked_type().as<TensorTypeNode>();
-      ICHECK(ttype);
-      StorageToken* token = arena_->make<StorageToken>();
+    for (const auto& ttype : FlattenTupleType(op->checked_type())) {
+      auto* token = arena_->make<StorageToken>();
       token->ttype = ttype;
-      token->device_type = device_type;
+      token->virtual_device = virtual_device;
       tokens.push_back(token);
     }
     token_map_[op] = tokens;
   }
 
-  void VisitExpr_(const CallNode* op) final {
+  using StorageAllocaBaseVisitor::DeviceAwareVisitExpr_;
+
+  void DeviceAwareVisitExpr_(const CallNode* call_node) final {
     // create token for the call node.
-    CreateToken(op, true);
+    CreateToken(call_node, true);
 
     // for each input, visit argument token.
-    for (Expr arg : op->args) {
+    for (Expr arg : call_node->args) {
       for (StorageToken* tok : GetToken(arg)) {
         tok->ref_counter += 1;
       }
@@ -198,13 +205,16 @@ class StorageAllocaInit : protected StorageAllocaBaseVisitor {
  private:
   // allocator
   support::Arena* arena_;
-  Map<Expr, Integer> node_device_map_;
+  Map<Expr, Array<String>> node_storage_map_;
 };
 
+/*! \brief Associate storage with every expression, reusing storage where possible. */
 class StorageAllocator : public StorageAllocaBaseVisitor {
  public:
+  StorageAllocator() = default;
+
   /*!
-   * \return totoal number of bytes allocated
+   * \return total number of bytes allocated
    */
   size_t TotalAllocBytes() const {
     size_t total = 0;
@@ -216,6 +226,8 @@ class StorageAllocator : public StorageAllocaBaseVisitor {
 
   // Run storage allocation for a function.
   StaticMemoryPlan Plan(const Function& func) {
+    VLOG_CONTEXT << "StorageAllocator";
+    VLOG(1) << "planning:" << std::endl << PrettyPrint(func);
     prototype_ = StorageAllocaInit(&arena_).GetInitTokenMap(func);
     this->Run(func);
 
@@ -227,47 +239,54 @@ class StorageAllocator : public StorageAllocaBaseVisitor {
 
     for (const auto& kv : token_map_) {
       std::vector<int64_t> storage_ids;
-      std::vector<DLDeviceType> device_types;
+      storage_ids.reserve(kv.second.size());
+      std::vector<VirtualDevice> virtual_devices;
+      virtual_devices.reserve(kv.second.size());
       std::vector<int64_t> sid_sizes_byte;
+      sid_sizes_byte.reserve(kv.second.size());
 
       for (StorageToken* tok : kv.second) {
-        if (tok->device_type) {
+        VLOG(1) << "token: " << tok->ToString();
+        if (tok->is_valid()) {
           num_annotated_nodes++;
         }
         num_nodes++;
         storage_ids.push_back(tok->storage_id);
-        device_types.push_back(static_cast<DLDeviceType>(tok->device_type));
-        sid_sizes_byte.push_back(GetMemorySize(tok));
+        virtual_devices.push_back(tok->virtual_device);
+        sid_sizes_byte.push_back(allocator_.GetMemorySize(tok));
       }
-      auto storage_info = backend::StorageInfo(storage_ids, device_types, sid_sizes_byte);
+      auto storage_info = backend::StorageInfo(std::move(storage_ids), std::move(virtual_devices),
+                                               std::move(sid_sizes_byte));
       smap.Set(GetRef<Expr>(kv.first), storage_info);
     }
     // Either all or none of the nodes should be annotated.
+    VLOG(1) << "num annotated nodes / num_nodes: " << num_annotated_nodes << " / " << num_nodes
+            << std::endl;
     if (num_annotated_nodes != 0 && num_annotated_nodes != num_nodes) {
       LOG(FATAL) << num_annotated_nodes << " out of " << num_nodes
                  << "expressions are assigned with virtual device types. Either all "
                     "or none of the expressions are expected to be annotated.";
     }
-
     return backend::StaticMemoryPlan(smap);
   }
 
  protected:
-  using StorageAllocaBaseVisitor::VisitExpr_;
   // override create token by getting token as prototype requirements.
-  void CreateToken(const ExprNode* op, bool can_realloc) final {
+  void CreateTokenOnDevice(const ExprNode* op, const VirtualDevice& virtual_device,
+                           bool can_realloc) final {
     ICHECK(!token_map_.count(op));
     auto it = prototype_.find(op);
     ICHECK(it != prototype_.end());
     std::vector<StorageToken*> tokens;
 
     for (StorageToken* tok : it->second) {
+      ICHECK(tok->virtual_device == virtual_device);
       if (can_realloc) {
-        tokens.push_back(Request(tok));
+        tokens.push_back(allocator_.Request(tok));
       } else {
         // Allocate a new token,
-        StorageToken* allocated_tok = Alloc(tok, GetMemorySize(tok));
-        allocated_tok->device_type = tok->device_type;
+        StorageToken* allocated_tok = allocator_.Alloc(tok);
+        allocated_tok->virtual_device = tok->virtual_device;
         // ensure it never get de-allocated.
         allocated_tok->ref_counter += 1;
         tokens.push_back(allocated_tok);
@@ -275,6 +294,7 @@ class StorageAllocator : public StorageAllocaBaseVisitor {
     }
     token_map_[op] = tokens;
   }
+
   // Mark op to reuse the input_token
   // tie the two memories together
   void ReuseInputToken(const ExprNode* op, StorageToken* input_token) {
@@ -291,11 +311,16 @@ class StorageAllocator : public StorageAllocaBaseVisitor {
     token_map_[op] = {input_token};
   }
 
+  using StorageAllocaBaseVisitor::DeviceAwareVisitExpr_;
+
   // The call map
-  void VisitExpr_(const CallNode* op) final {
+  void DeviceAwareVisitExpr_(const CallNode* call_node) final {
     std::vector<StorageToken*> args;
     // for each input, visit argument token.
-    for (Expr arg : op->args) {
+
+    for (const Expr& arg : call_node->args) {
+      // Note: GetToken skips GlobalVars and handles tuples properly, so we don't need to treat
+      // call_lowered specially.
       for (StorageToken* tok : GetToken(arg)) {
         args.push_back(tok);
       }
@@ -309,150 +334,71 @@ class StorageAllocator : public StorageAllocaBaseVisitor {
     //
     // TODO(tvm-team) Update checks of flat memory enablement when we support
     // opaque-nd memory planning to skip this path.
-    if (IsReshape(op)) {
-      // TODO(@electriclilies, jroesch): This check is failing because the size of args is 3
-      // I can't figure out where the extra args are coming from, I assume it must be related
-      // to the relay_attrs field we added to the TIRCallArgs, but I don't know where / how
-      // that's happening...
-      ICHECK_EQ(args.size(), 1U);
-      ReuseInputToken(op, args[0]);
+    // TODO(mbs): "reshape" cleanup.
+    CallLoweredProps call_lowered_props = GetCallLoweredProps(call_node);
+    if (call_lowered_props.lowered_func.defined() && IsReshapeOnly(call_lowered_props)) {
+      ICHECK_EQ(call_lowered_props.arguments.size(), 1U);
+      ReuseInputToken(call_node, args[0]);
     } else {
       // create token for the call node.
-      CreateToken(op, true);
+      CreateToken(call_node, true);
     }
 
     // check if there is orphaned output that can be released immediately.
-    for (StorageToken* tok : token_map_.at(op)) {
-      CheckForRelease(tok);
+    for (StorageToken* tok : token_map_.at(call_node)) {
+      allocator_.CheckForRelease(tok);
     }
     for (StorageToken* tok : args) {
       tok->ref_counter -= 1;
-      CheckForRelease(tok);
+      allocator_.CheckForRelease(tok);
     }
   }
-  /*!
-   * \brief ceil(size/word_size) to get number of words.
-   * \param size The original size.
-   * \param word_size The element size.
-   */
-  static size_t DivRoundUp(size_t size, size_t word_size) {
-    return (size + word_size - 1) / word_size;
-  }
-  /*!
-   * \brief The call is an reshape only op
-   * \param call The call to be checked.
-   * \return the check result.
-   */
-  static bool IsReshape(const CallNode* call) {
-    if (const auto* fn = call->op.as<FunctionNode>()) {
-      return fn->HasNonzeroAttr(attr::kReshapeOnly);
+
+  class TokenAllocator {
+   public:
+    StorageToken* Alloc(StorageToken* proto) {
+      return Is2DStorage(proto) ? token_2d_.Alloc(proto, storage_ids_++)
+                                : token_1d_.Alloc(proto, storage_ids_++);
+    }
+    StorageToken* Request(StorageToken* proto) {
+      StorageToken* token =
+          Is2DStorage(proto) ? token_2d_.Request(proto) : token_1d_.Request(proto);
+      return token ? token : this->Alloc(proto);
+    }
+    void CheckForRelease(StorageToken* tok) {
+      return Is2DStorage(tok) ? token_2d_.CheckForRelease(tok) : token_1d_.CheckForRelease(tok);
     }
 
-    if (call->attrs.defined()) {
-      if (auto tir_call_attrs = call->attrs.as<TIRCallAttrs>()) {
-        Map<String, ObjectRef> metadata = tir_call_attrs->metadata;
-        return metadata.count(attr::kReshapeOnly) &&
-               (Downcast<tvm::Integer>(metadata[attr::kReshapeOnly])->value == 1);
-      }
+    size_t GetMemorySize(StorageToken* tok) {
+      // TODO(amalyshe): figure out who requries sizes and for what
+      // size in case of texture is not enough - we can return any value if it
+      // assumed to be used for memory allocatoion or we can return real size
+      // if it is just for information
+      return Is2DStorage(tok) ? 0 : token_1d_.GetMemorySize(tok);
+    }
+    static bool Is2DStorage(StorageToken* tok) {
+      return relay::Is2DStorage(tok->virtual_device->memory_scope);
     }
 
-    return false;
-  }
-  /*!
-   * \brief Get the memory requirement.
-   * \param prototype The prototype token.
-   * \return The required memory size.
-   */
-  size_t GetMemorySize(StorageToken* prototype) {
-    const TensorTypeNode* ttype = prototype->ttype;
-    ICHECK(ttype != nullptr);
-    size_t size = 1;
-    for (IndexExpr dim : ttype->shape) {
-      const int64_t* pval = tir::as_const_int(dim);
-      ICHECK(pval != nullptr) << "Cannot allocate memory symbolic tensor shape " << ttype->shape;
-      ICHECK_GE(*pval, 0) << "Cannot allocate memory for tensor with negative shape" << *pval;
-      size *= static_cast<size_t>(pval[0]);
-    }
-    size *= DivRoundUp(ttype->dtype.bits() * ttype->dtype.lanes(), 8);
-    return size;
-  }
-  /*!
-   * \brief Request a storage token for a given prototype.
-   * \param prototype. The prototype storage token.
-   * \return The result token.
-   */
-  StorageToken* Request(StorageToken* prototype) {
-    // calculate the size;
-    size_t size = GetMemorySize(prototype);
-    // search memory block in [size / match_range_, size * match_range_)
-    if (match_range_ == 0) {
-      return this->Alloc(prototype, size);
-    }
-    auto begin = free_.lower_bound(size / match_range_);
-    auto mid = free_.lower_bound(size);
-    auto end = free_.upper_bound(size * match_range_);
-    // search for memory blocks larger than requested
-    for (auto it = mid; it != end; ++it) {
-      StorageToken* tok = it->second;
-      if (tok->device_type != prototype->device_type) continue;
-      ICHECK_EQ(tok->ref_counter, 0);
-      // Use exect matching strategy
-      tok->max_bytes = std::max(size, tok->max_bytes);
-      tok->ref_counter = prototype->ref_counter;
-      // find a exact match, erase from map and return
-      free_.erase(it);
-      return tok;
-    }
-    // then search for memory blocks smaller than requested space
-    for (auto it = mid; it != begin;) {
-      --it;
-      StorageToken* tok = it->second;
-      if (tok->device_type != prototype->device_type) continue;
-      ICHECK_EQ(tok->ref_counter, 0);
-      // Use exect matching strategy
-      tok->max_bytes = std::max(size, tok->max_bytes);
-      tok->ref_counter = prototype->ref_counter;
-      // erase from map and return
-      free_.erase(it);
-      return tok;
-    }
-    // cannot find anything return a new one.
-    return this->Alloc(prototype, size);
-  }
-  /*!
-   * \brief Allocate a storage token by consuming prototype
-   * \param prototype The prototype token.
-   * \param size The size of memory being requested.
-   */
-  StorageToken* Alloc(StorageToken* prototype, size_t size) {
-    prototype->max_bytes = size;
-    prototype->storage_id = static_cast<int64_t>(data_.size());
-    data_.push_back(prototype);
-    return prototype;
-  }
-  /*!
-   * \brief Check if we can release token.
-   * \param tok The token to be released.
-   */
-  void CheckForRelease(StorageToken* tok) {
-    ICHECK_GE(tok->storage_id, 0);
-    ICHECK_GE(tok->ref_counter, 0);
-    if (tok->ref_counter == 0) {
-      free_.insert({tok->max_bytes, tok});
-    }
-  }
+   private:
+    int64_t storage_ids_{0};
+    TokenAllocator1D token_1d_;
+    TokenAllocator2D token_2d_;
+  };
 
  private:
   // allocator
   support::Arena arena_;
   // scale used for rough match
-  size_t match_range_{16};
+  // size_t match_range_{16};
   // free list of storage entry
   std::multimap<size_t, StorageToken*> free_;
   // all the storage resources available
   std::vector<StorageToken*> data_;
   /*! \brief internal prototype token map */
-  std::unordered_map<const ExprNode*, std::vector<StorageToken*> > prototype_;
+  std::unordered_map<const ExprNode*, std::vector<StorageToken*>> prototype_;
+  /*! \brief token allocator for optimizing 1d and 2d token alloc requests */
+  TokenAllocator allocator_;
 };
 
 StaticMemoryPlan GraphPlanMemory(const Function& func) { return StorageAllocator().Plan(func); }

@@ -37,11 +37,17 @@ namespace runtime {
 // Library module that exposes symbols from a library.
 class LibraryModuleNode final : public ModuleNode {
  public:
-  explicit LibraryModuleNode(ObjectPtr<Library> lib) : lib_(lib) {}
+  explicit LibraryModuleNode(ObjectPtr<Library> lib, PackedFuncWrapper wrapper)
+      : lib_(lib), packed_func_wrapper_(wrapper) {}
 
   const char* type_key() const final { return "library"; }
 
-  PackedFunc GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self) final {
+  /*! \brief Get the property of the runtime module .*/
+  int GetPropertyMask() const final {
+    return ModulePropertyMask::kBinarySerializable | ModulePropertyMask::kRunnable;
+  };
+
+  PackedFunc GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self) final {
     TVMBackendPackedCFunc faddr;
     if (name == runtime::symbol::tvm_module_main) {
       const char* entry_name =
@@ -53,11 +59,12 @@ class LibraryModuleNode final : public ModuleNode {
       faddr = reinterpret_cast<TVMBackendPackedCFunc>(lib_->GetSymbol(name.c_str()));
     }
     if (faddr == nullptr) return PackedFunc();
-    return WrapPackedFunc(faddr, sptr_to_self);
+    return packed_func_wrapper_(faddr, sptr_to_self);
   }
 
  private:
   ObjectPtr<Library> lib_;
+  PackedFuncWrapper packed_func_wrapper_;
 };
 
 /*!
@@ -105,7 +112,8 @@ Module LoadModuleFromBinary(const std::string& type_key, dmlc::Stream* stream) {
   const PackedFunc* f = Registry::Get(fkey);
   if (f == nullptr) {
     std::string loaders = "";
-    for (auto name : Registry::ListNames()) {
+    for (auto reg_name : Registry::ListNames()) {
+      std::string name = reg_name;
       if (name.find(loadkey, 0) == 0) {
         if (loaders.size() > 0) {
           loaders += ", ";
@@ -113,8 +121,8 @@ Module LoadModuleFromBinary(const std::string& type_key, dmlc::Stream* stream) {
         loaders += name.substr(loadkey.size());
       }
     }
-    LOG(FATAL) << "Binary was created using " << type_key
-               << " but a loader of that name is not registered. Available loaders are " << loaders
+    LOG(FATAL) << "Binary was created using {" << type_key
+               << "} but a loader of that name is not registered. Available loaders are " << loaders
                << ". Perhaps you need to recompile with this runtime enabled.";
   }
 
@@ -128,7 +136,8 @@ Module LoadModuleFromBinary(const std::string& type_key, dmlc::Stream* stream) {
  * \param root_module the output root module
  * \param dso_ctx_addr the output dso module
  */
-void ProcessModuleBlob(const char* mblob, ObjectPtr<Library> lib, runtime::Module* root_module,
+void ProcessModuleBlob(const char* mblob, ObjectPtr<Library> lib,
+                       PackedFuncWrapper packed_func_wrapper, runtime::Module* root_module,
                        runtime::ModuleNode** dso_ctx_addr = nullptr) {
   ICHECK(mblob != nullptr);
   uint64_t nbytes = 0;
@@ -152,7 +161,7 @@ void ProcessModuleBlob(const char* mblob, ObjectPtr<Library> lib, runtime::Modul
     // "_lib" serves as a placeholder in the module import tree to indicate where
     // to place the DSOModule
     if (tkey == "_lib") {
-      auto dso_module = Module(make_object<LibraryModuleNode>(lib));
+      auto dso_module = Module(make_object<LibraryModuleNode>(lib, packed_func_wrapper));
       *dso_ctx_addr = dso_module.operator->();
       ++num_dso_module;
       modules.emplace_back(dso_module);
@@ -170,7 +179,7 @@ void ProcessModuleBlob(const char* mblob, ObjectPtr<Library> lib, runtime::Modul
   // if we are using old dll, we don't have import tree
   // so that we can't reconstruct module relationship using import tree
   if (import_tree_row_ptr.empty()) {
-    auto n = make_object<LibraryModuleNode>(lib);
+    auto n = make_object<LibraryModuleNode>(lib, packed_func_wrapper);
     auto module_import_addr = ModuleInternal::GetImportsAddr(n.operator->());
     for (const auto& m : modules) {
       module_import_addr->emplace_back(m);
@@ -194,9 +203,9 @@ void ProcessModuleBlob(const char* mblob, ObjectPtr<Library> lib, runtime::Modul
   }
 }
 
-Module CreateModuleFromLibrary(ObjectPtr<Library> lib) {
+Module CreateModuleFromLibrary(ObjectPtr<Library> lib, PackedFuncWrapper packed_func_wrapper) {
   InitContextFunctions([lib](const char* fname) { return lib->GetSymbol(fname); });
-  auto n = make_object<LibraryModuleNode>(lib);
+  auto n = make_object<LibraryModuleNode>(lib, packed_func_wrapper);
   // Load the imported modules
   const char* dev_mblob =
       reinterpret_cast<const char*>(lib->GetSymbol(runtime::symbol::tvm_dev_mblob));
@@ -204,7 +213,7 @@ Module CreateModuleFromLibrary(ObjectPtr<Library> lib) {
   Module root_mod;
   runtime::ModuleNode* dso_ctx_addr = nullptr;
   if (dev_mblob != nullptr) {
-    ProcessModuleBlob(dev_mblob, lib, &root_mod, &dso_ctx_addr);
+    ProcessModuleBlob(dev_mblob, lib, packed_func_wrapper, &root_mod, &dso_ctx_addr);
   } else {
     // Only have one single DSO Module
     root_mod = Module(n);

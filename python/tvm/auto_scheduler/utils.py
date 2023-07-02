@@ -20,9 +20,6 @@
 
 from typing import Hashable
 import json
-import multiprocessing
-import multiprocessing.pool
-import queue
 import signal
 import threading
 import traceback
@@ -289,41 +286,15 @@ def call_func_with_thread(func, args, kwargs):
     return res[0]
 
 
-def _func_wrapper(que, func, args, kwargs, add_thread_wrapper):
-    """Call function and return the result over the queue."""
-    try:
-        if add_thread_wrapper:
-            # Add a new layer of threadinng to avoid the conflict between
-            # python's multiprocessing and tvm's thread pool.
-            res = call_func_with_thread(func, args, kwargs)
-        else:
-            res = func(*args, **kwargs)
-        que.put(res)
-    except Exception:  # pylint: disable=broad-except
-        que.put(Exception(make_traceback_info()))
-
-
-def call_func_with_timeout(timeout, func, args=(), kwargs=None, add_thread_wrapper=False):
+def call_func_with_timeout(
+    worker, timeout, func, args=(), kwargs=None
+):  # pylint: disable=unused-argument
     """Call a function with timeout"""
-    que = multiprocessing.Queue(2)
-    process = multiprocessing.Process(
-        target=_func_wrapper, args=(que, func, args, kwargs or {}, add_thread_wrapper)
-    )
-    process.start()
-
+    worker.send(func, args, kwargs, timeout)
     try:
-        res = que.get(timeout=timeout)
-    except queue.Empty:
-        res = TimeoutError()
-
-    # clean queue and process
-    kill_child_processes(process.pid)
-    process.terminate()
-    process.join()
-    que.close()
-    que.join_thread()
-    del process
-    del que
+        res = worker.recv()
+    except Exception:  # pylint: disable=broad-except
+        res = Exception(make_traceback_info())
 
     return res
 
@@ -388,9 +359,7 @@ def check_remote(device_key, host=None, port=None, priority=100, timeout=10):
     def _check():
         request_remote(device_key, host, port, priority)
 
-    t = threading.Thread(
-        target=_check,
-    )
+    t = threading.Thread(target=_check)
     t.start()
     t.join(timeout)
     return not t.is_alive()
@@ -436,6 +405,6 @@ def to_str_round(x, decimal=6):
     if isinstance(x, int):
         return str(x)
     if isinstance(x, (np.float32, np.float64, float)):
-        format_str = "%%.%df" % decimal
+        format_str = f"%.{decimal}f"
         return format_str % x
-    raise ValueError("Invalid value: " + str(x) + "\ttype: " + str(type(x)))
+    raise ValueError(f"Invalid value: {str(x)}\ttype: {type(x)}")

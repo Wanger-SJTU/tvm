@@ -477,7 +477,7 @@ def _alter_conv2d_layout(attrs, inputs, tinfos, out_type):
     target = tvm.target.Target.current(allow_none=False)
     dispatch_ctx = autotvm.task.DispatchContext.current
 
-    _, outs = relay.backend.compile_engine.select_implementation(
+    _, outs = relay.backend.te_compiler.select_implementation(
         relay.op.get("nn.conv2d"), attrs, tinfos, out_type, target
     )
     workload = autotvm.task.get_workload(outs)
@@ -509,7 +509,7 @@ def _alter_conv2d_layout(attrs, inputs, tinfos, out_type):
         CO, _, KH, KW = get_const_tuple(kernel.shape)
         VC = cfg["tile_co"].size[-1]
 
-        new_attrs["kernel_layout"] = "OIHW%do" % VC
+        new_attrs["kernel_layout"] = f"OIHW{VC}o"
 
         new_data = data
         new_kernel = te.placeholder((idxd(CO, VC), CI, KH, KW, VC), dtype=kernel.dtype)

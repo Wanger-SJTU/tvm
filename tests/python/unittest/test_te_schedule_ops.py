@@ -14,9 +14,17 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+import numpy as np
+
 import tvm
 from tvm import te
-import numpy as np
+from tvm.driver.build_module import schedule_to_module
+
+
+def test_const():
+    x = tvm.te.const(1, "int32")
+    assert x.dtype == "int32"
+    assert isinstance(x, tvm.tir.IntImm)
 
 
 def test_schedule0():
@@ -26,11 +34,8 @@ def test_schedule0():
     A1 = te.compute((m, l), lambda i, j: A[i, j], name="A1")
     s = te.create_schedule(A1.op)
 
-    bounds = tvm.te.schedule.InferBound(s)
-    assert isinstance(bounds, tvm.container.Map)
-    stmt = tvm.te.schedule.ScheduleOps(s, bounds)
-    func = tvm.te.schedule.SchedulePostProcToPrimFunc([A, A1], stmt, None)
-    assert isinstance(func, tvm.tir.PrimFunc)
+    mod = schedule_to_module(s, [A, A1])
+    assert isinstance(mod["main"], tvm.tir.PrimFunc)
 
 
 def test_schedule1():
@@ -42,12 +47,9 @@ def test_schedule1():
     s = te.create_schedule(A1.op)
     xo, xi = s[A1].split(A1.op.axis[0], 8)
     s[A1].pragma(xo, "auto_unroll_max_step", 10)
-    bounds = tvm.te.schedule.InferBound(s)
-    assert isinstance(bounds, tvm.container.Map)
-    stmt = tvm.te.schedule.ScheduleOps(s, bounds)
 
-    func = tvm.te.schedule.SchedulePostProcToPrimFunc([A, A1], stmt, None)
-    assert isinstance(func, tvm.tir.PrimFunc)
+    mod = schedule_to_module(s, [A, A1])
+    assert isinstance(mod["main"], tvm.tir.PrimFunc)
 
 
 def test_schedule2():
@@ -60,11 +62,9 @@ def test_schedule2():
     s = te.create_schedule(A2.op)
     xo, xi = s[A2].split(A2.op.axis[0], 8)
     s[A1].compute_at(s[A2], xo)
-    bounds = tvm.te.schedule.InferBound(s)
-    assert isinstance(bounds, tvm.container.Map)
-    stmt = tvm.te.schedule.ScheduleOps(s, bounds)
-    func = tvm.te.schedule.SchedulePostProcToPrimFunc([A, A2], stmt, None)
-    assert isinstance(func, tvm.tir.PrimFunc)
+
+    mod = schedule_to_module(s, [A, A2])
+    assert isinstance(mod["main"], tvm.tir.PrimFunc)
 
 
 def test_schedule_scan():
@@ -614,6 +614,57 @@ def test_local_stage_predicate2():
     assert any(collect_visit(lowered_body, visit_stmt))
 
 
+def test_schedule_record_gemm():
+    with tvm.transform.PassContext(config={"te.keep_schedule_record": True}):
+        M, K, N = 1024, 1024, 1024
+        k = te.reduce_axis((0, K), "k")
+        A = te.placeholder((M, K), name="A")
+        B = te.placeholder((K, N), name="B")
+        C = te.compute((M, N), lambda m, n: te.sum(A[m, k] * B[k, n], axis=k), name="C")
+        s = te.create_schedule(C.op)
+        # currently there are no other applied primitives
+        # size of schedule record is expected to be 1 (vanilla schedule)
+        assert len(s.schedule_record) == 1
+        # apply sequential optimizatoin primitives
+        block_size, factor = 32, 8
+        # tile -> split + split + reorder
+        mo, no, mi, ni = s[C].tile(C.op.axis[0], C.op.axis[1], block_size, block_size)
+        ko, ki = s[C].split(k, factor=factor)
+        s[C].reorder(mo, ko, no, mi, ki, ni)
+        s[C].vectorize(ni)
+        s[C].parallel(mo)
+        assert len(s.schedule_record) == 8
+        # compare primitive names
+        expected_names = [
+            "vanilla",
+            "split",
+            "split",
+            "reorder",
+            "split",
+            "reorder",
+            "vectorize",
+            "parallel",
+        ]
+        for i in range(len(s.schedule_record)):
+            assert s.primitive_record[i] == expected_names[i]
+
+
+def test_schedule_record_misc():
+    s = te.create_schedule([])
+    # size of schedule record is expected to be 0 (no storing behavior)
+    assert len(s.schedule_record) == 0
+
+    with tvm.transform.PassContext(config={"te.keep_schedule_record": True}):
+        s = te.create_schedule([])
+        # size of schedule record is expected to be 1 (vanilla schedule)
+        assert len(s.schedule_record) == 1
+
+        stg = te.compute((), lambda *args: 0, name="empty_op")
+        s = te.create_schedule(stg.op)
+        # size of schedule record is expected to be 1 (vanilla schedule)
+        assert len(s.schedule_record) == 1
+
+
 if __name__ == "__main__":
     test_loop_dep_reduce()
     test_loop_dep_reduce_cache_write()
@@ -640,3 +691,5 @@ if __name__ == "__main__":
     test_schedule_compute_inline()
     test_local_stage_predicate()
     test_local_stage_predicate2()
+    test_schedule_record_gemm()
+    test_schedule_record_misc()

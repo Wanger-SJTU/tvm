@@ -42,7 +42,7 @@ struct Registry::Manager {
   // This is because PackedFunc can contain callbacks into the host language (Python) and the
   // resource can become invalid because of indeterministic order of destruction and forking.
   // The resources will only be recycled during program exit.
-  std::unordered_map<std::string, Registry*> fmap;
+  std::unordered_map<String, Registry*> fmap;
   // mutex
   std::mutex mutex;
 
@@ -62,7 +62,7 @@ Registry& Registry::set_body(PackedFunc f) {  // NOLINT(*)
   return *this;
 }
 
-Registry& Registry::Register(const std::string& name, bool can_override) {  // NOLINT(*)
+Registry& Registry::Register(const String& name, bool can_override) {  // NOLINT(*)
   Manager* m = Manager::Global();
   std::lock_guard<std::mutex> lock(m->mutex);
   if (m->fmap.count(name)) {
@@ -75,7 +75,7 @@ Registry& Registry::Register(const std::string& name, bool can_override) {  // N
   return *r;
 }
 
-bool Registry::Remove(const std::string& name) {
+bool Registry::Remove(const String& name) {
   Manager* m = Manager::Global();
   std::lock_guard<std::mutex> lock(m->mutex);
   auto it = m->fmap.find(name);
@@ -84,7 +84,7 @@ bool Registry::Remove(const std::string& name) {
   return true;
 }
 
-const PackedFunc* Registry::Get(const std::string& name) {
+const PackedFunc* Registry::Get(const String& name) {
   Manager* m = Manager::Global();
   std::lock_guard<std::mutex> lock(m->mutex);
   auto it = m->fmap.find(name);
@@ -92,10 +92,10 @@ const PackedFunc* Registry::Get(const std::string& name) {
   return &(it->second->func_);
 }
 
-std::vector<std::string> Registry::ListNames() {
+std::vector<String> Registry::ListNames() {
   Manager* m = Manager::Global();
   std::lock_guard<std::mutex> lock(m->mutex);
-  std::vector<std::string> keys;
+  std::vector<String> keys;
   keys.reserve(m->fmap.size());
   for (const auto& kv : m->fmap) {
     keys.push_back(kv.first);
@@ -120,9 +120,9 @@ class EnvCAPIRegistry {
    * \brief Callback to check if signals have been sent to the process and
    *        if so invoke the registered signal handler in the frontend environment.
    *
-   *  When runnning TVM in another langugage(python), the signal handler
+   *  When running TVM in another language (Python), the signal handler
    *  may not be immediately executed, but instead the signal is marked
-   *  in the interpreter state(to ensure non-blocking of the signal handler).
+   *  in the interpreter state (to ensure non-blocking of the signal handler).
    *
    * \return 0 if no error happens, -1 if error happens.
    */
@@ -141,7 +141,7 @@ class EnvCAPIRegistry {
   }
 
   // register environment(e.g. python) specific api functions
-  void Register(const std::string& symbol_name, void* fptr) {
+  void Register(const String& symbol_name, void* fptr) {
     if (symbol_name == "PyErr_CheckSignals") {
       Update(symbol_name, &pyerr_check_signals, fptr);
     } else {
@@ -162,7 +162,7 @@ class EnvCAPIRegistry {
  private:
   // update the internal API table
   template <typename FType>
-  void Update(const std::string& symbol_name, FType* target, void* ptr) {
+  void Update(const String& symbol_name, FType* target, void* ptr) {
     FType ptr_casted = reinterpret_cast<FType>(ptr);
     if (target[0] != nullptr && target[0] != ptr_casted) {
       LOG(WARNING) << "tvm.runtime.RegisterEnvCAPI overrides an existing function " << symbol_name;
@@ -176,10 +176,10 @@ void EnvCheckSignals() { EnvCAPIRegistry::Global()->CheckSignals(); }
 }  // namespace runtime
 }  // namespace tvm
 
-/*! \brief entry to to easily hold returning information */
+/*! \brief entry to easily hold returning information */
 struct TVMFuncThreadLocalEntry {
   /*! \brief result holder for returning strings */
-  std::vector<std::string> ret_vec_str;
+  std::vector<tvm::runtime::String> ret_vec_str;
   /*! \brief result holder for returning string pointers */
   std::vector<const char*> ret_vec_charp;
 };
@@ -189,8 +189,11 @@ typedef dmlc::ThreadLocalStore<TVMFuncThreadLocalEntry> TVMFuncThreadLocalStore;
 
 int TVMFuncRegisterGlobal(const char* name, TVMFunctionHandle f, int override) {
   API_BEGIN();
+  using tvm::runtime::GetRef;
+  using tvm::runtime::PackedFunc;
+  using tvm::runtime::PackedFuncObj;
   tvm::runtime::Registry::Register(name, override != 0)
-      .set_body(*static_cast<tvm::runtime::PackedFunc*>(f));
+      .set_body(GetRef<PackedFunc>(static_cast<PackedFuncObj*>(f)));
   API_END();
 }
 
@@ -198,7 +201,12 @@ int TVMFuncGetGlobal(const char* name, TVMFunctionHandle* out) {
   API_BEGIN();
   const tvm::runtime::PackedFunc* fp = tvm::runtime::Registry::Get(name);
   if (fp != nullptr) {
-    *out = new tvm::runtime::PackedFunc(*fp);  // NOLINT(*)
+    tvm::runtime::TVMRetValue ret;
+    ret = *fp;
+    TVMValue val;
+    int type_code;
+    ret.MoveToCHost(&val, &type_code);
+    *out = val.v_handle;
   } else {
     *out = nullptr;
   }

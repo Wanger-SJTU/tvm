@@ -29,6 +29,7 @@ from .op import (
     debug,
     register_external_compiler,
     register_fake_quantization_to_integer,
+    register_optional_fake_quantization_to_integer,
     register_mixed_precision_conversion,
 )
 from . import strategy
@@ -54,6 +55,7 @@ from . import _tensor_grad
 from . import _transform
 from . import _reduce
 from . import _algorithm
+from . import _math
 
 
 def _register_op_make():

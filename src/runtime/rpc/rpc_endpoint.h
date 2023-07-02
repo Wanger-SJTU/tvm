@@ -34,6 +34,7 @@
 #include "../../support/ring_buffer.h"
 #include "../minrpc/rpc_reference.h"
 #include "rpc_channel.h"
+#include "rpc_channel_logger.h"
 #include "rpc_session.h"
 
 namespace tvm {
@@ -67,8 +68,22 @@ enum class TrackerCode : int {
  */
 class RPCEndpoint {
  public:
-  /*! \brief virtual destructor */
+  /*! \brief virtual destructor
+   * Closes the connection if the connection hasn't already been closed.
+   */
   ~RPCEndpoint();
+
+  /*!
+   *  \brief Shutdown RPC connection.
+   *
+   *  Shutdown has no effect if the connection has already been shut down.
+   *  Shutdown will wait for all output currently queued from the RPC connection (i.e. The user
+   * doesn't need to wait for completion before calling Shutdown.) Any further use of objects that
+   * depended on the endpoint (e.g. A tvm.nd.array allocated on the remote RPC session) may throw an
+   * exception when used.
+   */
+  void Shutdown();
+
   /*!
    *  \brief The server loop that server runs to handle RPC calls.
    */
@@ -163,9 +178,11 @@ class RPCEndpoint {
    * \param remote_key The remote key of the session
    *   if remote_key equals "%toinit", we need to re-intialize
    *   it by event handler.
+   * \param fcleanup The cleanup Packed function.
    */
   static std::shared_ptr<RPCEndpoint> Create(std::unique_ptr<RPCChannel> channel, std::string name,
-                                             std::string remote_key);
+                                             std::string remote_key,
+                                             TypedPackedFunc<void()> fcleanup = nullptr);
 
  private:
   class EventHandler;
@@ -174,10 +191,9 @@ class RPCEndpoint {
   RPCCode HandleUntilReturnEvent(bool client_mode, RPCSession::FEncodeReturn setreturn);
   // Initalization
   void Init();
-  // Shutdown
-  void Shutdown();
   // Internal channel.
   std::unique_ptr<RPCChannel> channel_;
+
   // Internal mutex
   std::mutex mutex_;
   // Internal ring buffer.
@@ -190,6 +206,8 @@ class RPCEndpoint {
   std::string name_;
   // The remote key
   std::string remote_key_;
+  // Invoked when the RPC session is terminated
+  TypedPackedFunc<void()> fcleanup_;
 };
 
 /*!

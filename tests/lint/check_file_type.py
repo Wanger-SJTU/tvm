@@ -68,6 +68,7 @@ ALLOW_EXTENSION = {
     "plist",
     "xcworkspacedata",
     "storyboard",
+    "xcscheme",
     # hw/chisel
     "sbt",
     "properties",
@@ -80,6 +81,18 @@ ALLOW_EXTENSION = {
     "idl",
     # opencl file
     "cl",
+    # zephyr config file
+    "conf",
+    # arduino sketch file
+    "ino",
+    # linker scripts
+    "ld",
+    # Jinja2 templates
+    "j2",
+    # Jenkinsfiles
+    "groovy",
+    # Python-parseable config files
+    "ini",
 }
 
 # List of file names allowed
@@ -91,13 +104,15 @@ ALLOW_FILE_NAME = {
     "Makefile",
     "Doxyfile",
     "pylintrc",
+    "condarc",
     "rat-excludes",
     "log4j.properties",
     ".clang-format",
     ".gitmodules",
-    "CODEOWNERS",
+    "CODEOWNERSHIP",
     ".scalafmt.conf",
     "Cargo.lock",
+    "poetry.lock",
     "with_the_same_user",
 }
 
@@ -127,41 +142,30 @@ ALLOW_SPECIFIC_FILE = {
     # pytest config
     "pytest.ini",
     # microTVM tests
-    "tests/micro/zephyr/testdata/digit-2.jpg",
-    "tests/micro/zephyr/testdata/digit-9.jpg",
-    "tests/micro/zephyr/testdata/mnist-8.onnx",
-    "tests/micro/zephyr/testdata/ic_sample_fp32_8.npy",
+    "tests/micro/testdata/mnist/digit-2.jpg",
+    "tests/micro/testdata/mnist/digit-9.jpg",
+    "tests/micro/testdata/mnist/mnist-8.onnx",
     # microTVM Zephyr runtime
-    "apps/microtvm/zephyr/qemu-hack/qemu-system-i386",
-    "apps/microtvm/zephyr/qemu-hack/qemu-system-arm",
-    "apps/microtvm/zephyr/qemu-hack/qemu-system-riscv32",
-    "apps/microtvm/zephyr/qemu-hack/qemu-system-riscv64",
-    "apps/microtvm/zephyr/qemu-hack/qemu-system-xilinx-aarch64",
-    "apps/microtvm/zephyr/host_driven/prj.conf",
-    "apps/microtvm/zephyr/host_driven/boards/qemu_x86.conf",
-    "apps/microtvm/zephyr/host_driven/boards/qemu_riscv32.conf",
-    "apps/microtvm/zephyr/host_driven/boards/qemu_riscv64.conf",
-    "apps/microtvm/zephyr/host_driven/boards/nrf5340dk_nrf5340_cpuapp.conf",
-    "apps/microtvm/zephyr/host_driven/boards/nucleo_f746zg.conf",
-    "apps/microtvm/zephyr/host_driven/boards/stm32f746g_disco.conf",
-    "apps/microtvm/zephyr/host_driven/boards/mps2_an521.conf",
-    "apps/microtvm/zephyr/host_driven/boards/nucleo_l4r5zi.conf",
-    "apps/microtvm/zephyr/host_driven/boards/qemu_cortex_r5.conf",
-    "apps/microtvm/zephyr/host_driven/qemu-hack",
-    "apps/microtvm/zephyr/aot_demo/prj.conf",
-    "apps/microtvm/zephyr/aot_demo/boards/qemu_x86.conf",
-    "apps/microtvm/zephyr/aot_demo/boards/qemu_riscv32.conf",
-    "apps/microtvm/zephyr/aot_demo/boards/qemu_riscv64.conf",
-    "apps/microtvm/zephyr/aot_demo/boards/nrf5340dk_nrf5340_cpuapp.conf",
-    "apps/microtvm/zephyr/aot_demo/boards/nucleo_f746zg.conf",
-    "apps/microtvm/zephyr/aot_demo/boards/stm32f746g_disco.conf",
-    "apps/microtvm/zephyr/aot_demo/boards/mps2_an521.conf",
-    "apps/microtvm/zephyr/aot_demo/boards/nucleo_l4r5zi.conf",
-    "apps/microtvm/zephyr/aot_demo/boards/qemu_cortex_r5.conf",
-    "apps/microtvm/zephyr/aot_demo/qemu-hack",
+    "apps/microtvm/zephyr/template_project/CMakeLists.txt.template",
+    "apps/microtvm/zephyr/template_project/qemu-hack/qemu-system-arm",
+    "apps/microtvm/zephyr/template_project/qemu-hack/qemu-system-xilinx-aarch64",
+    "apps/microtvm/zephyr/template_project/qemu-hack/qemu-system-i386",
+    "apps/microtvm/zephyr/template_project/qemu-hack/qemu-system-riscv32",
+    "apps/microtvm/zephyr/template_project/qemu-hack/qemu-system-riscv64",
+    "apps/microtvm/zephyr/template_project/fvp-hack/FVP_Corstone_SSE-300_Ethos-U55",
+    "apps/microtvm/zephyr/template_project/app-overlay/nucleo_l4r5zi.overlay",
+    # microTVM Arduino runtime
+    "apps/microtvm/arduino/template_project/Makefile.template",
+    # microTVM CRT
+    "src/runtime/crt/crt_config.h.template",
+    "src/runtime/crt/host/CMakeLists.txt.template",
     # microTVM Virtual Machines
-    "apps/microtvm/reference-vm/zephyr/Vagrantfile",
-    "apps/microtvm/reference-vm/zephyr/base-box/Vagrantfile.packer-template",
+    "apps/microtvm/poetry.lock",
+    "apps/microtvm/reference-vm/Vagrantfile",
+    "apps/microtvm/reference-vm/base-box/Vagrantfile.packer-template",
+    # Hexagon
+    "src/runtime/hexagon/rpc/android_bash.sh.template",
+    "src/runtime/hexagon/profiler/lwp_handler.S",
 }
 
 
@@ -245,7 +249,7 @@ def main():
     if error_list:
         report = "------File type check report----\n"
         report += "\n".join(error_list)
-        report += "\nFound %d files that are now allowed\n" % len(error_list)
+        report += "\nFound %d files that are not allowed\n" % len(error_list)
         report += (
             "We do not check in binary files into the repo.\n"
             "If necessary, please discuss with committers and"

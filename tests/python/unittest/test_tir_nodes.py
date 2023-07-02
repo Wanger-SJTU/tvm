@@ -14,14 +14,20 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-import tvm
-from tvm import te
 import numpy as np
+import pytest
+import tvm
+from tvm import ir, te
 
 
 def test_const():
     x = tvm.tir.const(1, "int32")
-    print(x.dtype)
+    assert x.dtype == "int32"
+    assert isinstance(x, tvm.tir.IntImm)
+
+
+def test_te_const():
+    x = tvm.te.const(1, "int32")
     assert x.dtype == "int32"
     assert isinstance(x, tvm.tir.IntImm)
 
@@ -83,11 +89,18 @@ def test_ir():
 
 
 def test_ir2():
+    buf_size = te.var("size")
     x = te.var("n")
-    a = te.var("array", "handle")
-    st = tvm.tir.Store(a, x + 1, 1)
-    assert isinstance(st, tvm.tir.Store)
-    assert st.buffer_var == a
+
+    storage_type = ir.PrimType("int32")
+    handle_type = ir.PointerType(storage_type)
+    array = te.var("array", handle_type)
+    buf = tvm.tir.decl_buffer([buf_size], "int32", data=array)
+
+    st = tvm.tir.BufferStore(buf, x + 1, [1])
+    assert isinstance(st, tvm.tir.BufferStore)
+    assert st.buffer == buf
+    assert st.buffer.data == array
 
 
 def test_let():
@@ -103,6 +116,14 @@ def test_cast():
     assert isinstance(y, tvm.tir.Cast)
     assert isinstance(z, tvm.tir.Broadcast)
     assert z.lanes == 4
+
+    s = tvm.tir.StringImm("s")
+    with pytest.raises(tvm.error.TVMError):
+        try:
+            s.astype("int")
+        except Exception as e:
+            assert "Can't cast a handle to other types" in str(e)
+            raise
 
 
 def test_attr():
@@ -124,7 +145,7 @@ def test_basic():
     a = te.var("a")
     b = te.var("b")
     c = a + b
-    assert str(c) == "(%s: int32 + %s: int32)" % (a.name, b.name)
+    assert str(c) == "%s + %s" % (a.name, b.name)
 
 
 def test_stmt():
@@ -158,8 +179,8 @@ def test_any():
         assert False
     except ValueError:
         pass
-    assert str(tvm.tir.any(x < y)) == "(%s: int32 < %s: int32)" % (x.name, y.name)
-    assert str(tvm.tir.any(x < y, x > z)) == "((%s: int32 < %s: int32) || (%s > %s: int32))" % (
+    assert str(tvm.tir.any(x < y)) == "%s < %s" % (x.name, y.name)
+    assert str(tvm.tir.any(x < y, x > z)) == "%s < %s or %s > %s" % (
         x.name,
         y.name,
         x.name,
@@ -167,7 +188,7 @@ def test_any():
     )
     assert str(
         tvm.tir.any(x < y, y > z + 1, x < z * 2)
-    ) == "(((%s: int32 < %s: int32) || (%s > (%s: int32 + 1))) || (%s < (%s*2)))" % (
+    ) == "%s < %s or %s > %s + 1 or %s < %s * 2" % (
         x.name,
         y.name,
         y.name,
@@ -191,8 +212,8 @@ def test_all():
         assert False
     except ValueError:
         pass
-    assert str(tvm.tir.all(x < y)) == "(%s: int32 < %s: int32)" % (x.name, y.name)
-    assert str(tvm.tir.all(x < y, x > z)) == "((%s: int32 < %s: int32) && (%s > %s: int32))" % (
+    assert str(tvm.tir.all(x < y)) == "%s < %s" % (x.name, y.name)
+    assert str(tvm.tir.all(x < y, x > z)) == "%s < %s and %s > %s" % (
         x.name,
         y.name,
         x.name,
@@ -200,7 +221,7 @@ def test_all():
     )
     assert str(
         tvm.tir.all(x < y, y > z + 1, x < z * 2)
-    ) == "(((%s: int32 < %s: int32) && (%s > (%s: int32 + 1))) && (%s < (%s*2)))" % (
+    ) == "%s < %s and %s > %s + 1 and %s < %s * 2" % (
         x.name,
         y.name,
         y.name,
@@ -213,19 +234,19 @@ def test_all():
 def test_bitwise():
     x = te.var("x")
     y = te.var("y")
-    assert str(x << y) == "@tir.shift_left(x: int32, y: int32, dtype=int32)"
-    assert str(x >> y) == "@tir.shift_right(x: int32, y: int32, dtype=int32)"
-    assert str(x & y) == "@tir.bitwise_and(x: int32, y: int32, dtype=int32)"
-    assert str(x | y) == "@tir.bitwise_or(x: int32, y: int32, dtype=int32)"
-    assert str(x ^ y) == "@tir.bitwise_xor(x: int32, y: int32, dtype=int32)"
-    assert str(10 & x) == "@tir.bitwise_and(10, x: int32, dtype=int32)"
-    assert str(10 | x) == "@tir.bitwise_or(10, x: int32, dtype=int32)"
-    assert str(10 ^ x) == "@tir.bitwise_xor(10, x: int32, dtype=int32)"
-    assert str(10 >> x) == "@tir.shift_right(10, x: int32, dtype=int32)"
-    assert str(10 << x) == "@tir.shift_left(10, x: int32, dtype=int32)"
-    assert str(10 % x) == "floormod(10, x: int32)"
+    assert str(x << y) == "T.shift_left(x, y)"
+    assert str(x >> y) == "T.shift_right(x, y)"
+    assert str(x & y) == "T.bitwise_and(x, y)"
+    assert str(x | y) == "T.bitwise_or(x, y)"
+    assert str(x ^ y) == "T.bitwise_xor(x, y)"
+    assert str(10 & x) == "T.bitwise_and(10, x)"
+    assert str(10 | x) == "T.bitwise_or(10, x)"
+    assert str(10 ^ x) == "T.bitwise_xor(10, x)"
+    assert str(10 >> x) == "T.shift_right(10, x)"
+    assert str(10 << x) == "T.shift_left(10, x)"
+    assert str(10 % x) == "10 % x"
 
-    assert str(~x) == "@tir.bitwise_not(x: int32, dtype=int32)"
+    assert str(~x) == "T.bitwise_not(x)"
     assert (tvm.tir.const(1, "int8x2") >> 1).dtype == "int8x2"
     assert (x >> tvm.tir.const(1, "int32x2")).dtype == "int32x2"
     assert (te.var("z", "int8x2") << tvm.tir.const(1, "int8x2")).dtype == "int8x2"
@@ -283,14 +304,20 @@ def test_divide_by_zero():
             pass
 
 
+def test_infinity():
+    assert str(tvm.tir.infinity("float16")) == 'T.float16("inf")'
+    assert str(tvm.tir.infinity("float32")) == 'T.float32("inf")'
+    assert str(tvm.tir.infinity("float64")) == 'T.float64("inf")'
+
+
 def test_isnan():
     x = te.var("x", "float32")
-    assert str(tvm.tir.isnan(x)) == "@tir.isnan(x: float32, dtype=bool)"
+    assert str(tvm.tir.isnan(x)) == "T.isnan(x)"
     assert str(tvm.tir.isnan(x).dtype) == "bool"
     y = te.var("y", "float16")
-    assert str(tvm.tir.isnan(y)) == "@tir.isnan(cast(float32, y: float16), dtype=bool)"
+    assert str(tvm.tir.isnan(y)) == 'T.isnan(T.Cast("float32", y))'
     z = te.var("z", "int32")
-    assert str(tvm.tir.isnan(z)) == "False"
+    assert str(tvm.tir.isnan(z)) == "T.bool(False)"
     k = te.var("k", "int8x2")
     assert str(tvm.tir.isnan(k).dtype) == "uint1x2"
 
@@ -319,7 +346,6 @@ def test_prim_func():
 
     func = tvm.tir.PrimFunc([x, y, b], stmt)
     # make sure we can print
-    func.astext()
     assert func.buffer_map[func.params[2]].same_as(b)
 
     assert len(func.buffer_map) == 1
@@ -375,121 +401,5 @@ def test_intimm_cond():
     assert x == 1
 
 
-def test_block_blockrealize():
-    x = tvm.tir.Var("x", "int32")
-    y = tvm.tir.Var("y", "int32")
-    vx = tvm.tir.IterVar((16, 16), "vx", 0)
-    vx_var = vx.var
-    vy = tvm.tir.IterVar((16, 16), "vy", 2)
-    vy_var = vy.var
-    A = tvm.tir.decl_buffer((16), "float32")
-    B = tvm.tir.decl_buffer((16, 16), "float32")
-    alloc_buffer = tvm.tir.decl_buffer((16, 16), "float32")
-    match_buffer = tvm.tir.decl_buffer((16, 16), "float32")
-    init_body = tvm.tir.BufferStore(A, 0.0, [vx_var])
-    body = tvm.tir.BufferStore(
-        A,
-        tvm.tir.BufferLoad(A, [vx_var]) + tvm.tir.BufferLoad(B, [vx_var, vy_var]),
-        [vx_var],
-    )
-    reads = [
-        tvm.tir.BufferRegion(
-            B, [tvm.ir.Range.from_min_extent(vx_var, 1), tvm.ir.Range.from_min_extent(vy_var, 1)]
-        )
-    ]
-    writes = [tvm.tir.BufferRegion(A, [tvm.ir.Range.from_min_extent(vx_var, 1)])]
-    block_match_buffer = tvm.tir.MatchBufferRegion(
-        match_buffer, tvm.tir.BufferRegion(B, [tvm.ir.Range(0, 16), tvm.ir.Range(0, 16)])
-    )
-
-    block = tvm.tir.Block(
-        [vx, vy],
-        reads,
-        writes,
-        "block",
-        body,
-        init=init_body,
-        alloc_buffers=[alloc_buffer],
-        match_buffers=[block_match_buffer],
-        annotations={"attr_key": "attr_value"},
-    )
-
-    # Checking Block
-    assert isinstance(block, tvm.tir.Block)
-    # Checking iter_vars
-    assert block.iter_vars[0] == vx
-    assert block.iter_vars[1] == vy
-    # Checking reads/writes region
-    assert isinstance(block.reads[0], tvm.tir.BufferRegion)
-    assert block.reads[0].buffer == B
-    assert block.reads[0].region[0].min == vx_var
-    assert block.reads[0].region[1].min == vy_var
-    assert isinstance(block.writes[0], tvm.tir.BufferRegion)
-    assert block.writes[0].buffer == A
-    assert block.writes[0].region[0].min == vx_var
-    assert block.writes[0].region[0].extent == 1
-    # Checking name_hint
-    assert block.name_hint == "block"
-    # Checking body
-    assert block.body == body
-    # Checking init
-    assert block.init == init_body
-    # Checking alloc_buffers
-    assert block.alloc_buffers[0] == alloc_buffer
-    # Checking match_buffers
-    assert block.match_buffers[0].buffer == match_buffer
-    assert isinstance(block.match_buffers[0].source, tvm.tir.BufferRegion)
-    assert block.match_buffers[0].source.buffer == B
-    assert block.match_buffers[0].source.region[0].min == 0
-    assert block.match_buffers[0].source.region[0].extent == 16
-
-    # Checking BlockRealize
-    block_realize = tvm.tir.BlockRealize([x, y], tvm.tir.const(True, "bool"), block)
-    assert isinstance(block_realize, tvm.tir.BlockRealize)
-    assert block_realize.iter_values[0] == x
-    assert block_realize.iter_values[1] == y
-    assert block_realize.predicate == tvm.tir.const(True, "bool")
-    assert block_realize.block == block
-
-    # make sure we can print using ReprPrinter
-    str(block)
-    str(block_realize)
-    # make sure we can print using TIRTextPrinter
-    func = tvm.tir.PrimFunc([], block_realize)
-    output = func.astext()
-    assert output.find("meta[tir.BlockRealise]") == -1
-    assert output.find("bind") != -1
-    assert output.find("reads") != -1
-    assert output.find("writes") != -1
-    assert output.find("alloc_buffer") != -1
-    assert output.find("match_buffer") != -1
-    assert output.find("attr") != -1
-    assert output.find("with init()") != -1
-
-
 if __name__ == "__main__":
-    test_intimm_cond()
-    test_buffer_load_store()
-    test_vars()
-    test_prim_func()
-    test_cast()
-    test_attr()
-    test_const()
-    test_scalar_dtype_inference()
-    test_make()
-    test_ir()
-    test_basic()
-    test_stmt()
-    test_let()
-    test_dir()
-    test_dtype()
-    test_any()
-    test_all()
-    test_bitwise()
-    test_float_bitwise()
-    test_shift_bounds()
-    test_divide_by_zero()
-    test_isnan()
-    test_equality()
-    test_equality_string_imm()
-    test_block_blockrealize()
+    tvm.testing.main()

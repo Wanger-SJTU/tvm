@@ -60,7 +60,7 @@ def register(op_name, describe=""):
 
 
 def register_stateful(op_name, stateful, level=10):
-    """Register operator pattern for an op.
+    """Register stateful flag for an op.
 
     Parameters
     ----------
@@ -81,7 +81,7 @@ class OpPattern(object):
 
     See Also
     --------
-    top.tag : Contains explanation of the tag type.
+    topi.tag : Contains explanation of the tag type.
     """
 
     # Elementwise operator
@@ -192,15 +192,15 @@ def _wrap_default_fstrategy(compute, schedule, name):
 def _create_fstrategy_from_schedule(op_name, schedule):
     assert hasattr(schedule, "dispatch_dict")
     compute = get(op_name).get_attr("FTVMCompute")
-    assert compute is not None, "FTVMCompute is not registered for op %s" % op_name
-    fstrategy = get_native_generic_func("{}_strategy".format(op_name))
+    assert compute is not None, f"FTVMCompute is not registered for op {op_name}"
+    fstrategy = get_native_generic_func(f"{op_name}_strategy")
     name_pfx = schedule.__name__
     name_pfx = name_pfx[name_pfx.index("_") + 1 :]
     fstrategy.set_default(
-        _wrap_default_fstrategy(compute, schedule.fdefault, "%s.generic" % name_pfx)
+        _wrap_default_fstrategy(compute, schedule.fdefault, f"{name_pfx}.generic")
     )
     for key, sch in schedule.dispatch_dict.items():
-        fstrategy.register(_wrap_default_fstrategy(compute, sch, "%s.%s" % (name_pfx, key)), [key])
+        fstrategy.register(_wrap_default_fstrategy(compute, sch, f"{name_pfx}.{key}"), [key])
     return fstrategy
 
 
@@ -341,6 +341,23 @@ def register_convert_op_layout(op_name, convert_layout=None, level=10):
     return tvm.ir.register_op_attr(op_name, "FTVMConvertOpLayout", convert_layout, level)
 
 
+def register_infer_correct_layout(op_name, infer_layout=None, level=10):
+    """Register infer op layout function for an op
+
+    Parameters
+    ----------
+    op_name : str
+        The name of the operator
+
+    infer_layout: function (attrs: Attrs, inputs: List[Layout]) -> InferCorrectLayoutOutput
+        The function to infer correct layout
+
+    level : int
+        The priority level
+    """
+    return tvm.ir.register_op_attr(op_name, "FInferCorrectLayout", infer_layout, level)
+
+
 def register_legalize(op_name, legal_op=None, level=10):
     """Register legal transformation function for an op
 
@@ -376,7 +393,7 @@ def register_pattern(op_name, pattern, level=10):
 
 
 def register_gradient(op_name, fgradient=None, level=10):
-    """Register operator pattern for an op.
+    """Register operator gradient function for an op.
 
     Parameters
     ----------
@@ -458,6 +475,27 @@ def register_fake_quantization_to_integer(op_name, func=None, level=10):
     return tvm.ir.register_op_attr(op_name, "FTVMFakeQuantizationToInteger", func, level)
 
 
+def register_optional_fake_quantization_to_integer(op_name, func=None, level=10):
+    """Register optional quantize function for an op
+
+    Given an op and Affine Types on it's inputs, this function should return the op
+    in affine space/integer operators and the new type of the output, where affine
+    denotes the transformation x_real = (x_affine - zero_point) * scale
+
+    Parameters
+    ----------
+    op_name : str
+        The name of the operator
+
+    func: function (expr: Expr, map: Map<Expr, AffineType>) -> new_expr: Expr
+        The function for translating the op into affine space and integer operators
+
+    level : int
+        The priority level
+    """
+    return tvm.ir.register_op_attr(op_name, "FTVMOptionalFakeQuantizationToInteger", func, level)
+
+
 def register_mixed_precision_conversion(op_name, func=None, level=10):
     """Register mixed precision conversion function for an op
 
@@ -505,7 +543,7 @@ def debug(expr, debug_func=None):
     global __DEBUG_COUNTER__
 
     if debug_func:
-        name = "debugger_func{}".format(__DEBUG_COUNTER__)
+        name = f"debugger_func{__DEBUG_COUNTER__}"
         tvm._ffi.register_func(name, debug_func)
         __DEBUG_COUNTER__ += 1
     else:

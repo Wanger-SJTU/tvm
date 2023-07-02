@@ -19,25 +19,56 @@ import os
 import re
 import sys
 import time
+from distutils.log import debug
 
+import numpy as np
 import pytest
-
 import tvm
 import tvm.testing
-from tvm import te
-import numpy as np
-from tvm import rpc
+from tvm import rpc, te
+from tvm._ffi.base import TVMError
 from tvm.contrib import utils
 from tvm.contrib.debugger import debug_executor
+from tvm import relay
+
+# Constants for creating simple graphs, fixtures to avoid free globals
+@pytest.fixture
+def n():
+    return 4
 
 
-@tvm.testing.requires_llvm
-def test_graph_simple():
-    n = 4
-    A = te.placeholder((n,), name="A")
-    B = te.compute(A.shape, lambda *i: A(*i) + 1.0, name="B")
-    s = te.create_schedule(B.op)
+@pytest.fixture
+def A(n):
+    return te.placeholder((n,), name="A")
 
+
+@pytest.fixture
+def B(A):
+    return te.compute(A.shape, lambda *i: A(*i) + 1.0, name="B")
+
+
+@pytest.fixture
+def s(B):
+    return te.create_schedule(B.op)
+
+
+@pytest.fixture
+def mlib(s, A, B):
+    return tvm.build(s, [A, B], "llvm", name="myadd")
+
+
+@pytest.fixture
+def myadd(mlib):
+    def _myadd(*args):
+        to_return = mlib["myadd"](*args)
+        time.sleep(0.25)
+        return to_return
+
+    return _myadd
+
+
+@pytest.fixture
+def graph():
     node0 = {"op": "null", "name": "x", "inputs": []}
     node1 = {
         "op": "tvm_op",
@@ -63,21 +94,19 @@ def test_graph_simple():
         "attrs": attrs,
     }
     graph = json.dumps(graph)
+    return graph
 
+
+@tvm.testing.requires_llvm
+@tvm.testing.requires_rpc
+@pytest.mark.skipif(
+    tvm.support.libinfo()["USE_PROFILER"] != "ON", reason="TVM was not built with profiler support"
+)
+def test_end_to_end_graph_simple(graph, n, A, B, s, myadd):
     def check_verify():
-        mlib = tvm.build(s, [A, B], "llvm", name="myadd")
-
-        def myadd(*args):
-            to_return = mlib["myadd"](*args)
-            time.sleep(0.25)
-            return to_return
-
         mlib_proxy = tvm.support.FrontendTestModule()
         mlib_proxy["myadd"] = myadd
-        try:
-            mod = debug_executor.create(graph, mlib_proxy, tvm.cpu(0))
-        except ValueError:
-            return
+        mod = debug_executor.create(graph, mlib_proxy, tvm.cpu(0))
 
         a = np.random.uniform(size=(n,)).astype(A.dtype)
         mod.set_input(x=a)
@@ -122,6 +151,7 @@ def test_graph_simple():
             "Shape",
             "Inputs",
             "Outputs",
+            "Measurements(us)",
         ]
         myadd_lines = split_debug_line(2)
         assert myadd_lines[0] == "add"
@@ -160,9 +190,8 @@ def test_graph_simple():
         # verify dump root delete after cleanup
         assert not os.path.exists(directory)
 
-    def check_remote():
+    def check_remote(server):
         mlib = tvm.build(s, [A, B], "llvm", name="myadd")
-        server = rpc.Server("127.0.0.1")
         remote = rpc.connect(server.host, server.port)
         temp = utils.tempdir()
         dev = remote.cpu(0)
@@ -182,8 +211,93 @@ def test_graph_simple():
         np.testing.assert_equal(out.numpy(), a + 1)
 
     check_verify()
-    check_remote()
+    check_remote(rpc.Server("127.0.0.1"))
+
+
+@tvm.testing.requires_llvm
+@pytest.mark.skipif(
+    tvm.support.libinfo()["USE_PROFILER"] != "ON", reason="TVM was not built with profiler support"
+)
+def test_run_single_node(graph, n, A, myadd):
+    mlib_proxy = tvm.support.FrontendTestModule()
+    mlib_proxy["myadd"] = myadd
+    mod: debug_executor.GraphModuleDebug = debug_executor.create(graph, mlib_proxy, tvm.cpu(0))
+
+    a = np.random.uniform(size=(n,)).astype(A.dtype)
+    mod.set_input(x=a)
+
+    assert len(mod.debug_datum.get_graph_nodes()) == 2
+    assert mod.debug_datum.get_graph_nodes()[0]["op"] == "param"
+    assert mod.debug_datum.get_graph_nodes()[1]["op"] == "myadd"
+
+    # Running a node with no associated function should return instantly and have 0 runtime
+    assert mod.run_individual_node(0, number=1).mean == 0
+
+    # Meanwhile the actual function should take some time, more time if you run it more times
+    repeat_1_result = mod.run_individual_node(1, repeat=1)
+    assert repeat_1_result.mean > 0
+
+    # Running multiple times (10) should take longer than 1 time
+    repeat_3_results = mod.run_individual_node(1, repeat=3)
+    assert sum(repeat_3_results.results) > sum(repeat_1_result.results)
+
+    # Increasing the number of repeats should give you the number of results asked for
+    assert len(mod.run_individual_node(1, repeat=10).results) == 10
+
+    # Doing repeat_ms should have the run time greater than the asked amount
+    start = time.time()
+    mod.run_individual_node(1, min_repeat_ms=500)
+    end = time.time()
+    elapsed_time_in_seconds = end - start
+    assert elapsed_time_in_seconds >= 0.5
+
+    # Doing `cooldown_interval_ms` should have the execution time increases
+    start = time.time()
+    mod.run_individual_node(1, repeat=2, min_repeat_ms=500, cooldown_interval_ms=1000)
+    end = time.time()
+    elapsed_time_in_seconds_with_def_rep = end - start
+    assert elapsed_time_in_seconds_with_def_rep >= 3
+
+    # Doing with `repeats_to_cooldown` not equal 1 should not trigger
+    # cooldown after each repeat
+    start = time.time()
+    mod.run_individual_node(
+        1, repeat=2, min_repeat_ms=500, cooldown_interval_ms=1000, repeats_to_cooldown=2
+    )
+    end = time.time()
+    elapsed_time_in_seconds_with_rep_2 = end - start
+    assert elapsed_time_in_seconds_with_rep_2 >= 2 and (
+        elapsed_time_in_seconds_with_rep_2 < elapsed_time_in_seconds_with_def_rep
+    )
+
+    # Going out of bounds of node index throws a tvm error
+    with pytest.raises(TVMError):
+        mod.run_individual_node(2)
+
+
+@tvm.testing.requires_llvm
+def test_multiple_output():
+    x = relay.var("x", shape=(1, 3, 48, 16), dtype="float32")
+    t = relay.split(x, [12, 16, 32], 2).astuple()
+    x0 = relay.TupleGetItem(t, 0)
+    x1 = relay.TupleGetItem(t, 1)
+    x2 = relay.TupleGetItem(t, 2)
+    x3 = relay.TupleGetItem(t, 3)
+    p0 = relay.const(np.random.uniform(-1, 1, (3, 3, 1, 1)).astype("float32"))
+    y = relay.nn.conv2d(x2, p0, kernel_size=(1, 1), kernel_layout="OIHW", out_dtype="float32") + x3
+
+    func = relay.Function([x], relay.Tuple([x0, x1, y]))
+    mod = tvm.IRModule.from_expr(func)
+    mod = relay.transform.InferType()(mod)
+    target = tvm.target.Target("llvm")
+    device = tvm.cpu()
+    lib = relay.build(mod, target=target)
+    m = debug_executor.GraphModuleDebug(
+        lib["debug_create"]("default", device), [device], lib.get_graph_json(), None
+    )
+    nodes = m.debug_datum.get_graph_nodes()
+    assert nodes[2]["shape"] == [3, 3, 1, 1]
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__] + sys.argv[1:]))
+    tvm.testing.main()

@@ -31,7 +31,6 @@ import numpy as np
 import tvm._ffi
 
 from tvm.target import Target
-from tvm.te import schedule
 from tvm.driver import build_module
 
 
@@ -39,13 +38,12 @@ def ana_lower(sch, args, binds=None, simple_mode=True):
     """Do lower while keeping all axes in IR
     i.e. Do not eliminate loop with extent of 1, do not vectorize, unroll or inject virtual threads
     """
-    binds, _ = build_module.get_binds(args, compact=False, binds=binds)
     sch = sch.normalize()
     # Phase 0
-    bounds = schedule.InferBound(sch)
-    stmt = schedule.ScheduleOps(sch, bounds, True)
-    func = schedule.SchedulePostProcToPrimFunc(args, stmt, None)
-    mod = tvm.IRModule.from_expr(func._move())
+    context = tvm.transform.PassContext(config={"tir.debug_keep_trivial_loop": True})
+    with context:
+        mod = build_module.schedule_to_module(sch, args, binds=binds)
+
     mod = tvm.tir.transform.StorageFlatten(64)(mod._move())
     mod = tvm.tir.transform.Simplify()(mod._move())
     assert simple_mode
@@ -138,7 +136,7 @@ def get_itervar_feature_flatten(sch, args, take_log=True):
     """
     stmt = ana_lower(sch, args, simple_mode=True)
     feas = _get_itervar_feature_flatten(stmt, take_log)
-    feas = struct.unpack("%df" % (len(feas) // 4), feas)
+    feas = struct.unpack(f"{len(feas) // 4}f", feas)
     return feas
 
 
@@ -156,8 +154,7 @@ def get_flatten_name(fea):
     """
 
     feature_name = {
-        "_attr_": ["length", "nest_level", "topdown", "bottomup"]
-        + ["ann_%d" % i for i in range(20)],
+        "_attr_": ["length", "nest_level", "topdown", "bottomup"] + [f"ann_{i}" for i in range(20)],
         "_arith_": ["add", "mul", "div"],
         "buf_touch": ["stride", "mod", "count", "reuse", "T_count", "T_reuse"],
     }
@@ -189,7 +186,7 @@ def get_flatten_name(fea):
                 name_list = feature_name["buf_touch"]
 
             for i in range(len((pair[1:]))):
-                names.append(".".join(["f%d" % ct, var_name, key, name_list[i]]))
+                names.append(".".join([f"f{ct}", var_name, key, name_list[i]]))
                 ct += 1
     return names
 
@@ -213,5 +210,5 @@ def get_buffer_curve_sample_flatten(sch, args, sample_n=30):
     """
     stmt = ana_lower(sch, args, simple_mode=True)
     feas = _get_buffer_curve_sample_flatten(stmt, sample_n, False)
-    feas = struct.unpack("%df" % (len(feas) // 4), feas)
+    feas = struct.unpack(f"{len(feas) // 4}f", feas)
     return feas

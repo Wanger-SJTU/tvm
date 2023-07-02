@@ -357,10 +357,10 @@ Stmt MakeComputeStmt(const ComputeOpNode* self, const Stage& stage,
     init = MergeNest(n.init_nest, init);
     init = Substitute(init, n.init_vmap);
     // common nest
-    std::vector<std::vector<Stmt> > common(n.main_nest.begin(),
-                                           n.main_nest.begin() + n.num_common_loop + 1);
-    std::vector<std::vector<Stmt> > reduce(n.main_nest.begin() + n.num_common_loop + 1,
-                                           n.main_nest.end());
+    std::vector<std::vector<Stmt>> common(n.main_nest.begin(),
+                                          n.main_nest.begin() + n.num_common_loop + 1);
+    std::vector<std::vector<Stmt>> reduce(n.main_nest.begin() + n.num_common_loop + 1,
+                                          n.main_nest.end());
     provide = MergeNest(reduce, provide);
     if (debug_keep_trivial_loop) {
       provide = MergeNest(common, provide);
@@ -387,7 +387,7 @@ enum class ComputeType { kNormal, kCrossThreadReduction, kTensorize };
 
 ComputeType DetectComputeType(const ComputeOpNode* self, const Stage& stage) {
   // Verify correctness of leaf nest.
-  int normal_red = 0, thread_red = 0, tensorize = 0;
+  int thread_red = 0, tensorize = 0;
 
   for (IterVar iv : stage->leaf_iter_vars) {
     IterVarAttr attr;
@@ -401,8 +401,6 @@ ComputeType DetectComputeType(const ComputeOpNode* self, const Stage& stage) {
     if (iv->iter_type == kCommReduce) {
       if (attr.defined() && attr->bind_thread.defined()) {
         ++thread_red;
-      } else {
-        ++normal_red;
       }
     } else {
       ICHECK_EQ(thread_red, 0) << "Cross thread reduce cannot swap with normal data axis";
@@ -484,7 +482,8 @@ ComputeLoopNest ComputeLoopNest::Create(const BaseComputeOpNode* self, const Sta
     }
     ret.init_nest = MakeLoopNest(stage, dom_map, begin_loop, true, skip_iter, &(ret.init_vmap),
                                  debug_keep_trivial_loop);
-    ret.init_predicates = MakeBoundCheck(stage, dom_map, ret.init_vmap, true, skip_iter);
+    ret.init_predicates =
+        MakeBoundCheck(stage, dom_map, ret.init_vmap, !stage->rolling_buffer, skip_iter);
     for (auto& e : ret.init_predicates) {
       e = likely(e);
     }

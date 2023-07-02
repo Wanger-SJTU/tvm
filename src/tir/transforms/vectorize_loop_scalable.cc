@@ -177,8 +177,9 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
   }
 
   PrimExpr VisitExpr_(const RampNode* op) final {
-    // This happens when the data tensor is a vector type. We scalarize in this
-    // case
+    
+    // This happens when the data tensor is a vector type. 
+    // We scalarize in this case
     need_scalarize_ = true;
     return GetRef<PrimExpr>(op);
   }

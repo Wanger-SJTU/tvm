@@ -49,7 +49,7 @@
 #ifndef TVM_IR_TYPE_H_
 #define TVM_IR_TYPE_H_
 
-#include <tvm/ir/span.h>
+#include <tvm/ir/source_map.h>
 #include <tvm/node/node.h>
 #include <tvm/runtime/container/array.h>
 #include <tvm/runtime/data_type.h>
@@ -164,10 +164,17 @@ class PointerTypeNode : public TypeNode {
   }
 
   bool SEqualReduce(const PointerTypeNode* other, SEqualReducer equal) const {
-    return equal(element_type, other->element_type);
+    // Make "global" equal to ""
+    String lhs_scope = storage_scope.empty() ? "global" : storage_scope;
+    String rhs_scope = other->storage_scope.empty() ? "global" : other->storage_scope;
+    return equal(element_type, other->element_type) && equal(lhs_scope, rhs_scope);
   }
 
-  void SHashReduce(SHashReducer hash_reduce) const { hash_reduce(element_type); }
+  void SHashReduce(SHashReducer hash_reduce) const {
+    hash_reduce(element_type);
+    // Make "global" equal to ""
+    hash_reduce(storage_scope.empty() ? "global" : storage_scope);
+  }
 
   static constexpr const char* _type_key = "PointerType";
   TVM_DECLARE_FINAL_OBJECT_INFO(PointerTypeNode, TypeNode);
@@ -199,6 +206,25 @@ enum TypeKind : int {
   kAdtHandle = 5,
   kTypeData = 6
 };
+
+/*! \brief Converts a TypeKind to a string. */
+inline String TypeKind2String(TypeKind kind) {
+  switch (kind) {
+    case TypeKind::kType:
+      return "Type";
+    case TypeKind::kShapeVar:
+      return "ShapeVar";
+    case TypeKind::kBaseType:
+      return "BaseType";
+    case TypeKind::kConstraint:
+      return "Constraint";
+    case TypeKind::kAdtHandle:
+      return "AdtHandle";
+    case TypeKind::kTypeData:
+      return "TypeData";
+  }
+  LOG(FATAL) << "ValueError: Unknown TypeKind: " << static_cast<int>(kind);
+}
 
 /*!
  * \brief Type parameter in functions.
@@ -418,7 +444,7 @@ class FuncTypeNode : public TypeNode {
   Array<TypeVar> type_params;
   /*!
    * \brief potential constraint the type need to obey
-   * \note this field is reserved for futher purposes.
+   * \note this field is reserved for further purposes.
    */
   Array<TypeConstraint> type_constraints;
 

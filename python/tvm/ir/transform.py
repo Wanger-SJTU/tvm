@@ -16,7 +16,6 @@
 # under the License.
 # pylint: disable=invalid-name,unused-argument
 """Common pass infrastructure across IR variants."""
-import types
 import inspect
 import functools
 
@@ -199,7 +198,7 @@ class Sequential(Pass):
         The list of passes that the sequential pass is dependent on.
     """
 
-    def __init__(self, passes=None, opt_level=2, name="sequential", required=None):
+    def __init__(self, passes=None, opt_level=0, name="sequential", required=None):
         passes = passes if passes else []
         if not isinstance(passes, (list, tuple)):
             raise TypeError("passes must be a list of Pass objects.")
@@ -340,7 +339,7 @@ def module_pass(pass_func=None, opt_level=None, name=None, required=None):
         info = PassInfo(opt_level, fname, required)
         if inspect.isclass(pass_arg):
             return _wrap_class_module_pass(pass_arg, info)
-        if not isinstance(pass_arg, (types.FunctionType, types.LambdaType)):
+        if not callable(pass_arg):
             raise TypeError("pass_func must be a callable for Module pass")
         return _ffi_transform_api.MakeModulePass(pass_arg, info)
 

@@ -24,6 +24,7 @@
 #include <tvm/runtime/registry.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/function.h>
+#include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 
 #include <functional>
@@ -44,6 +45,27 @@ inline bool IsParam(const PrimFunc& func, const Var& param) {
 }
 
 /**************** Specializer ****************/
+
+// Try fold constants if op's child get specialized to constant.
+#define DEFINE_SPECIALIZER_BINARY_OP_MUTATE(BinaryNode, BinaryFunc) \
+  PrimExpr VisitExpr_(const BinaryNode* op) final {                 \
+    PrimExpr a = VisitExpr(op->a);                                  \
+    PrimExpr b = VisitExpr(op->b);                                  \
+    if (a.same_as(op->a) && b.same_as(op->b)) {                     \
+      return GetRef<PrimExpr>(op);                                  \
+    } else {                                                        \
+      return BinaryFunc(a, b);                                      \
+    }                                                               \
+  }
+#define DEFINE_SPECIALIZER_UNARY_OP_MUTATE(UnaryNode, UnaryFunc) \
+  PrimExpr VisitExpr_(const UnaryNode* op) final {               \
+    PrimExpr a = VisitExpr(op->a);                               \
+    if (a.same_as(op->a)) {                                      \
+      return GetRef<PrimExpr>(op);                               \
+    } else {                                                     \
+      return UnaryFunc(a);                                       \
+    }                                                            \
+  }
 
 /*! \brief Mutator to specialize function and remove const parameters */
 class PrimFuncSpecializer : public StmtExprMutator {
@@ -93,8 +115,7 @@ class PrimFuncSpecializer : public StmtExprMutator {
  private:
   Stmt VisitStmt_(const BlockNode* op) final {
     // Step.0. Define buffer mappings which is allocated inside the block
-    Array<Buffer> alloc_buffers = MutateArray(
-        op->alloc_buffers,
+    Array<Buffer> alloc_buffers = op->alloc_buffers.Map(
         std::bind(&PrimFuncSpecializer::MutateAllocBuffer, this, std::placeholders::_1));
 
     // Step.1. Recursively visit block body
@@ -102,14 +123,13 @@ class PrimFuncSpecializer : public StmtExprMutator {
     op = stmt.as<BlockNode>();
     ICHECK(op != nullptr);
 
-    Array<BufferRegion> reads = MutateArray(
-        op->reads,
+    Array<BufferRegion> reads = op->reads.Map(
         std::bind(&PrimFuncSpecializer::MutateBufferRegion, this, std::placeholders::_1));
-    Array<BufferRegion> writes = MutateArray(
-        op->writes,
+    Array<BufferRegion> writes = op->writes.Map(
         std::bind(&PrimFuncSpecializer::MutateBufferRegion, this, std::placeholders::_1));
 
-    if (alloc_buffers.same_as(op->alloc_buffers) && reads.same_as(op->reads)) {
+    if (alloc_buffers.same_as(op->alloc_buffers) && reads.same_as(op->reads) &&
+        writes.same_as(op->writes)) {
       return GetRef<Block>(op);
     } else {
       ObjectPtr<BlockNode> n = CopyOnWrite(op);
@@ -157,14 +177,32 @@ class PrimFuncSpecializer : public StmtExprMutator {
     }
   }
 
- private:
-  Buffer MutateBuffer(const Buffer& buffer) const {
-    Array<PrimExpr> shape =
-        MutateArray(buffer->shape, [this](const PrimExpr& e) { return Substitute(e, var_map_); });
-    Array<PrimExpr> strides =
-        MutateArray(buffer->strides, [this](const PrimExpr& e) { return Substitute(e, var_map_); });
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(AddNode, add);
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(SubNode, sub);
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(MulNode, mul);
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(DivNode, div);
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(ModNode, truncmod);
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(FloorDivNode, floordiv);
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(FloorModNode, floormod);
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(MaxNode, max);
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(MinNode, min);
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(EQNode, equal);
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(NENode, not_equal);
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(LTNode, less);
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(LENode, less_equal);
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(GTNode, greater);
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(GENode, greater_equal);
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(AndNode, logical_and);
+  DEFINE_SPECIALIZER_BINARY_OP_MUTATE(OrNode, logical_or);
+  DEFINE_SPECIALIZER_UNARY_OP_MUTATE(NotNode, logical_not);
 
-    PrimExpr elem_offset = Substitute(buffer->elem_offset, var_map_);
+ private:
+  Buffer MutateBuffer(const Buffer& buffer) {
+    Array<PrimExpr> shape = buffer->shape.Map([this](const PrimExpr& e) { return VisitExpr(e); });
+    Array<PrimExpr> strides =
+        buffer->strides.Map([this](const PrimExpr& e) { return VisitExpr(e); });
+
+    PrimExpr elem_offset = VisitExpr(buffer->elem_offset);
 
     if (buffer->elem_offset.same_as(elem_offset) && buffer->shape.same_as(shape) &&
         buffer->strides.same_as(strides)) {
@@ -201,13 +239,13 @@ class PrimFuncSpecializer : public StmtExprMutator {
 
   BufferRegion MutateBufferRegion(const BufferRegion& buffer_region) {
     auto it = buffer_map_.find(buffer_region->buffer);
-    Array<Range> region =
-        MutateArray(buffer_region->region,
-                    std::bind(&PrimFuncSpecializer::MutateRange, this, std::placeholders::_1));
+    const Buffer& buffer = it != buffer_map_.end() ? it->second : buffer_region->buffer;
+    Array<Range> region = buffer_region->region.Map(
+        std::bind(&PrimFuncSpecializer::MutateRange, this, std::placeholders::_1));
     if (it == buffer_map_.end() && region.same_as(buffer_region->region)) {
       return buffer_region;
     } else {
-      return BufferRegion(it->second, std::move(region));
+      return BufferRegion(buffer, std::move(region));
     }
   }
 
@@ -226,14 +264,14 @@ class PrimFuncSpecializer : public StmtExprMutator {
  * \param var_map The var mapping to be updated.
  * \note This function will match target buffer's shape, strides and element_offset
  *   For example, we define a buffer in PrimFunc:
- *   A = tir.match_buffer(a, [m, n])
+ *   A = T.match_buffer(a, [m, n])
  *
  *   Then we match it with a buffer B =  tir.decl_buffer((8, 16))
  *
  *   It means we have two var mappings here: m = 8 and n = 16
  *
  *   If the buffer signature is not a Var, the mapping will fail.
- *   e.g. A = tir.match_buffer(a, [m * 2, n + 1])
+ *   e.g. A = T.match_buffer(a, [m * 2, n + 1])
  */
 void UpdateSpecializeVarMap(const PrimFunc& func, const Var& param, const Buffer& specific_buf,
                             VarMap* var_map) {
@@ -322,6 +360,7 @@ PrimFunc Specialize(PrimFunc func, const Map<Var, ObjectRef>& param_map) {
     } else if (instance->IsInstance<PrimExprNode>()) {
       UpdateSpecializeVarMap(func, param, Downcast<PrimExpr>(instance), &var_map);
     } else {
+      CHECK(instance.defined()) << "Specialize instance is not defined for param " << param;
       LOG(FATAL) << "TypeError: specialize expected instance to be Buffer or PrimExpr, but got "
                  << instance->GetTypeKey();
     }

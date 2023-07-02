@@ -22,14 +22,20 @@ try:
 except ImportError:
     import tensorflow as tf
 import numpy as np
-from tvm import relay
+from tvm import relay, ir, testing
 from tvm.relay.frontend.tensorflow import from_tensorflow
 
 
 def run_relay(graph, shape_dict=None, *vars):
-    mod, params = from_tensorflow(graph.as_graph_def(add_shapes=True), shape=shape_dict)
-    ex = relay.create_executor("debug", mod=mod)
-    return ex.evaluate()(*vars)
+    with testing.disable_span_filling():
+        mod, params = from_tensorflow(graph.as_graph_def(add_shapes=True), shape=shape_dict)
+    with testing.enable_span_filling():
+        mod_with_span, _ = relay.frontend.from_tensorflow(
+            graph.as_graph_def(add_shapes=True), shape=shape_dict
+        )
+    assert ir.structural_equal(mod["main"], mod_with_span["main"])
+
+    return relay.create_executor("debug", mod=mod).evaluate()(*vars)
 
 
 def test_assert_true():

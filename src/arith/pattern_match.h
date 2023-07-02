@@ -104,18 +104,40 @@ class Pattern {
    *       and nest by reference for PVars.
    */
   using Nested = Derived;
+
   /*!
    * \brief Check if value matches the current pattern.
    *
    * This call also populates the PVars with matched value.
    * The values in PVars are valid until the next call to Match.
    *
+   * \param value The value to be matched against
+   *
    * \return whether value matches the pattern.
    */
   template <typename NodeType>
-  bool Match(const NodeType& value) const {
+  inline bool Match(const NodeType& value) const {
+    return Match(value, []() { return true; });
+  }
+
+  /*!
+   * \brief Check if value matches the current pattern.
+   *
+   * This call also populates the PVars with matched value.
+   * The values in PVars are valid until the next call to Match.
+   *
+   * \param value The value to be matched against
+   *
+   * \param cond A callable that performs additional validation,
+   * returning true if the match passes.  This will typically be a
+   * lambda function written in terms of the filled PVars.
+   *
+   * \return whether value matches the pattern.
+   */
+  template <typename NodeType, typename Condition>
+  bool Match(const NodeType& value, Condition cond) const {
     derived().InitMatch_();
-    return derived().Match_(value);
+    return derived().Match_(value) && cond();
   }
   /*! \return Derived instance of current class. */
   const Derived& derived() const { return *static_cast<const Derived*>(this); }
@@ -203,11 +225,80 @@ class PVar : public Pattern<PVar<T>> {
     return value_;
   }
 
+  T EvalOr(const T& default_value) const { return filled_ ? value_ : default_value; }
+
  protected:
   /*! \brief The matched value */
   mutable T value_;
   /*! \brief whether the variable has been filled */
   mutable bool filled_{false};
+};
+
+/*!
+ * \brief Wrapper for pattern variable container with extra match logic.
+ *
+ * \tparam Derived the type of derived class.
+ * \tparam T the type of the hole.
+ */
+template <typename Derived, typename T>
+class PVarWithCheck : public arith::Pattern<PVarWithCheck<Derived, T>> {
+ public:
+  // Store by reference in the expression.
+  using Nested = const PVarWithCheck<Derived, T>&;
+
+  void InitMatch_() const { pvar_.InitMatch_(); }
+
+  bool Match_(const T& value) const {
+    if (!static_cast<const Derived*>(this)->Match_(value)) return false;
+    return pvar_.Match_(value);
+  }
+
+  template <typename NodeRefType,
+            typename = typename std::enable_if<std::is_base_of<NodeRefType, T>::value>::type>
+  bool Match_(const NodeRefType& value) const {
+    if (const auto* ptr = value.template as<typename T::ContainerType>()) {
+      return Match_(GetRef<T>(ptr));
+    } else {
+      return false;
+    }
+  }
+
+  T Eval() const { return pvar_.Eval(); }
+
+ protected:
+  arith::PVar<T> pvar_;
+};
+
+/*!
+ * \brief Pattern variable container with expr type check.
+ *
+ * \tparam T the type of the hole.
+ * \tparam DType the Pattern type of dtype.
+ */
+template <typename T, typename DType,
+          typename = std::enable_if<std::is_base_of<T, PrimExpr>::value>>
+class PVarWithDataType : public PVarWithCheck<PVarWithDataType<T, DType>, T> {
+ public:
+  explicit PVarWithDataType(const DType& dtype) : dtype_(dtype) {}
+
+  bool Match_(const T& value) const { return dtype_.Match_(value->dtype); }
+
+ protected:
+  typename DType::Nested dtype_;
+};
+
+/*!
+ * \brief Pattern variable container for data type with lanes.
+ */
+class PVecDataType : public PVarWithCheck<PVecDataType, DataType> {
+ public:
+  /*! \brief construct vector dtype placeholder with element type check */
+  explicit PVecDataType(const DataType& elem_dtype) : elem_dtype_(elem_dtype) {}
+
+  bool Match_(const DataType& dtype) const { return dtype.code() == elem_dtype_.code(); }
+
+ protected:
+  DataType elem_dtype_;
 };
 
 /*!
@@ -261,8 +352,7 @@ class PBinaryExpr : public Pattern<PBinaryExpr<OpType, TA, TB>> {
   PrimExpr Eval() const {
     PrimExpr lhs = a_.Eval();
     PrimExpr rhs = b_.Eval();
-    PrimExpr ret = TryConstFold<OpType>(lhs, rhs);
-    if (ret.defined()) return ret;
+    if (auto ret = TryConstFold<OpType>(lhs, rhs)) return ret.value();
     return OpType(lhs, rhs);
   }
 
@@ -467,7 +557,7 @@ class PCastExpr : public Pattern<PCastExpr<DType, TA>> {
 /*!
  * \brief Construct a cast pattern.
  *
- * \param dtype The target data type, can be PVar<Type> or PConst<Type>.
+ * \param dtype The target data type, can be PVar<DataType> or PConst<DataType>.
  * \param value The input type.
  *
  * \return The result pattern.
@@ -745,6 +835,85 @@ inline PCallExpr<PIfThenElseOp, TCond, TA, TB> if_then_else(const Pattern<TCond>
                                                  false_value.derived());
 }
 
+template <typename... TPattern>
+class PMatchesOneOf {
+ public:
+  explicit PMatchesOneOf(const TPattern&... patterns) : patterns_{patterns...} {}
+
+  /*! \brief Check if value matches one of the patterns.
+   *
+   * This call also populates the PVars with matched value based on
+   * the first successful match.  The values in PVars are valid until
+   * the next call to Match.
+   *
+   * \param value The value to be matched against.
+   *
+   * \return Whether value matches the pattern.
+   */
+  template <typename NodeType>
+  inline bool Match(const NodeType& value) const {
+    return Match(value, []() { return true; });
+  }
+
+  /*! \brief Check if value matches one of the patterns.
+   *
+   * This call also populates the PVars with matched value based on
+   * the first successful match.  The values in PVars are valid until
+   * the next call to Match.
+   *
+   * \param value The value to be matched against.
+   *
+   * \param cond A callable that performs additional validation,
+   * returning true if the match passes.  This will typically be a
+   * lambda function written in terms of the filled PVars.  This will
+   * be called once for each successful pattern match.  If `cond()`
+   * returns false, the next match will be attempted.
+   *
+   * \return Whether value matches the pattern.
+   */
+  template <typename NodeType, typename Condition>
+  inline bool Match(const NodeType& value, Condition cond) const {
+    return MatchImpl(value, cond, std::make_index_sequence<sizeof...(TPattern)>());
+  }
+
+ private:
+  template <typename NodeType, typename Condition>
+  inline bool MatchImpl(const NodeType& value, Condition cond, std::index_sequence<>) const {
+    return false;
+  }
+
+  template <typename NodeType, typename Condition, size_t FirstIndex, size_t... RemainingIndices>
+  inline bool MatchImpl(const NodeType& value, Condition cond,
+                        std::index_sequence<FirstIndex, RemainingIndices...>) const {
+    return std::get<FirstIndex>(patterns_).Match(value, cond) ||
+           MatchImpl(value, cond, std::index_sequence<RemainingIndices...>());
+  }
+
+  // Hold the patterns by const&.  This follows the same usage as both
+  // the `PVar`, which occurs as `const PVar<T>&` when it appears
+  // inside other patterns.  Because the `PVar<T>::value_` field is
+  // mutable, it can still be updated through these const references.
+  // So long as the call to `Match()` occurs within the same
+  // expression as created the patterns, this avoids accidental copies
+  // without creating dangling references.  This may be improved in
+  // the future by use of `constexpr` constructors/operators, allowing
+  // more typical value semantics.
+  std::tuple<const TPattern&...> patterns_;
+};
+
+/* \brief Return a proxy object that returns true after the first match
+ *
+ * In the RewriteSimplifier, there are often several expressions that
+ * simplify to the same resulting expression.  This utility allows
+ * them to be specified as a single rule, reducing duplication of the
+ * result/condition of a rewrite.
+ */
+template <typename... TPattern>
+inline std::enable_if_t<(std::is_base_of_v<Pattern<TPattern>, TPattern> && ... && true),
+                        PMatchesOneOf<TPattern...>>
+matches_one_of(const TPattern&... patterns) {
+  return PMatchesOneOf<TPattern...>(patterns...);
+}
 }  // namespace arith
 }  // namespace tvm
 #endif  // TVM_ARITH_PATTERN_MATCH_H_

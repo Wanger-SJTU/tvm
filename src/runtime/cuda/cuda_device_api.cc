@@ -112,9 +112,14 @@ class CUDADeviceAPI final : public DeviceAPI {
     ICHECK_EQ(256 % alignment, 0U) << "CUDA space is aligned at 256 bytes";
     void* ret;
     if (dev.device_type == kDLCUDAHost) {
+      VLOG(1) << "allocating " << nbytes << "bytes on host";
       CUDA_CALL(cudaMallocHost(&ret, nbytes));
     } else {
       CUDA_CALL(cudaSetDevice(dev.device_id));
+      size_t free_mem, total_mem;
+      CUDA_CALL(cudaMemGetInfo(&free_mem, &total_mem));
+      VLOG(1) << "allocating " << nbytes << " bytes on device, with " << free_mem
+              << " bytes currently free out of " << total_mem << " bytes available";
       CUDA_CALL(cudaMalloc(&ret, nbytes));
     }
     return ret;
@@ -122,9 +127,11 @@ class CUDADeviceAPI final : public DeviceAPI {
 
   void FreeDataSpace(Device dev, void* ptr) final {
     if (dev.device_type == kDLCUDAHost) {
+      VLOG(1) << "freeing host memory";
       CUDA_CALL(cudaFreeHost(ptr));
     } else {
       CUDA_CALL(cudaSetDevice(dev.device_id));
+      VLOG(1) << "freeing device memory";
       CUDA_CALL(cudaFree(ptr));
     }
   }
@@ -245,9 +252,11 @@ TVM_REGISTER_GLOBAL("device_api.cuda_host").set_body([](TVMArgs args, TVMRetValu
   *rv = static_cast<void*>(ptr);
 });
 
-class GPUTimerNode : public TimerNode {
+class CUDATimerNode : public TimerNode {
  public:
   virtual void Start() {
+    // This initial cudaEventRecord is sometimes pretty slow (~100us). Does
+    // cudaEventRecord do some stream synchronization?
     CUDA_CALL(cudaEventRecord(start_, CUDAThreadEntry::ThreadLocal()->stream));
   }
   virtual void Stop() { CUDA_CALL(cudaEventRecord(stop_, CUDAThreadEntry::ThreadLocal()->stream)); }
@@ -257,28 +266,39 @@ class GPUTimerNode : public TimerNode {
     CUDA_CALL(cudaEventElapsedTime(&milliseconds, start_, stop_));
     return milliseconds * 1e6;
   }
-  virtual ~GPUTimerNode() {
+  virtual ~CUDATimerNode() {
     CUDA_CALL(cudaEventDestroy(start_));
     CUDA_CALL(cudaEventDestroy(stop_));
   }
-  GPUTimerNode() {
+  CUDATimerNode() {
     CUDA_CALL(cudaEventCreate(&start_));
     CUDA_CALL(cudaEventCreate(&stop_));
   }
 
-  static constexpr const char* _type_key = "GPUTimerNode";
-  TVM_DECLARE_FINAL_OBJECT_INFO(GPUTimerNode, TimerNode);
+  static constexpr const char* _type_key = "CUDATimerNode";
+  TVM_DECLARE_FINAL_OBJECT_INFO(CUDATimerNode, TimerNode);
 
  private:
   cudaEvent_t start_;
   cudaEvent_t stop_;
 };
 
-TVM_REGISTER_OBJECT_TYPE(GPUTimerNode);
+TVM_REGISTER_OBJECT_TYPE(CUDATimerNode);
 
-TVM_REGISTER_GLOBAL("profiling.timer.gpu").set_body_typed([](Device dev) {
-  return Timer(make_object<GPUTimerNode>());
+TVM_REGISTER_GLOBAL("profiling.timer.cuda").set_body_typed([](Device dev) {
+  return Timer(make_object<CUDATimerNode>());
 });
+
+TVM_DLL String GetCudaFreeMemory() {
+  size_t free_mem, total_mem;
+  CUDA_CALL(cudaMemGetInfo(&free_mem, &total_mem));
+  std::stringstream ss;
+  ss << "Current CUDA memory is " << free_mem << " bytes free out of " << total_mem
+     << " bytes on device";
+  return ss.str();
+}
+
+TVM_REGISTER_GLOBAL("runtime.GetCudaFreeMemory").set_body_typed(GetCudaFreeMemory);
 
 }  // namespace runtime
 }  // namespace tvm

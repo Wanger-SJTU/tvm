@@ -24,8 +24,8 @@
 #define TVM_TIR_SCHEDULE_STATE_H_
 
 #include <tvm/ir/module.h>
+#include <tvm/tir/block_scope.h>
 #include <tvm/tir/function.h>
-#include <tvm/tir/schedule/block_scope.h>
 
 #include <unordered_map>
 #include <utility>
@@ -51,13 +51,25 @@ struct BlockInfo {
    * produced by its producers
    */
   bool region_cover{false};
+  /*!
+   * \brief This property indicates that the block scope (rooted at its corresponding block) is
+   * equivalent to of a stage pipeline. Under the following conditions:
+   *
+   * 1) The region cover property holds for every of its child blocks
+   * 2) No write-after-read dependency or opaque dependency, only read-after-write and
+   * write-after-write are allowed
+   * 3) All the statements in the scope are schedulable statements, i.e. Block and For
+   */
+  bool stage_pipeline{false};
 
   BlockInfo() = default;
 
-  explicit BlockInfo(BlockScope scope, bool affine_binding = false, bool region_cover = false)
+  explicit BlockInfo(BlockScope scope, bool affine_binding = false, bool region_cover = false,
+                     bool stage_pipeline = false)
       : scope(std::move(scope)),         //
         affine_binding(affine_binding),  //
-        region_cover(region_cover) {}
+        region_cover(region_cover),
+        stage_pipeline(stage_pipeline) {}
 };
 
 /*!
@@ -80,7 +92,8 @@ enum ScheduleDebugMask : uint32_t {
  * 2) The sref tree of schedulable statements (indicated by the srefs)
  * 3) The dependency information of each block scope (block_info)
  * 4) A reverse mapping from the AST nodes to that in the sref tree (stmt2ref)
- * 5) A debug flag, if set, extra checking is enabled (debug_mode)
+ * 5) A debug flag, if set, extra checking is enabled (debug_mask)
+ * 6) A check flag, if set, enable prequisite check for schedule primitives (enable_check)
  */
 class ScheduleStateNode : public Object {
  public:
@@ -99,13 +112,18 @@ class ScheduleStateNode : public Object {
    * and each time after calling the Replace method.
    * \sa ScheduleDebugMask
    */
-  int debug_mode;
+  int debug_mask;
+  /*!
+   * \brief Whether to enable prequisite checks for schedule primitives.
+   */
+  bool enable_check;
 
   void VisitAttrs(AttrVisitor* v) {
     v->Visit("mod", &mod);
     // `block_info` is not visited
     // `stmt2ref` is not visited
-    v->Visit("debug_mode", &debug_mode);
+    v->Visit("debug_mask", &debug_mask);
+    v->Visit("enable_check", &enable_check);
   }
   /*!
    * \brief Replace the part of the AST, as being pointed to by `src_sref`,
@@ -129,7 +147,7 @@ class ScheduleStateNode : public Object {
   TVM_DLL void Replace(const tir::StmtSRef& src_sref, const Stmt& tgt_stmt,
                        const Map<Block, Block>& block_sref_reuse);
   /*!
-   * \brief Trigger the verification according to the `debug_mode` bitmask.
+   * \brief Trigger the verification according to the `debug_mask` bitmask.
    * 1) If the bitmask `kVerifySRefTree` is on, verify the correctness of the sref tree.
    * 2) If the bitmask `kVerifyCachedFlags` is on, verify the correctness of `affine_binding`,
    * `region_cover` and `stage_pipeline`
@@ -142,6 +160,12 @@ class ScheduleStateNode : public Object {
   /******** Property of blocks ********/
   /*! \brief Returns the BlockInfo correpsonding to the block sref */
   TVM_DLL BlockInfo GetBlockInfo(const StmtSRef& block_sref) const;
+  /*!
+   * \brief Recalculate the BlockInfo recursively under stmt.
+   * If stmt is a Block itself, we will not reset its affine binding flag unless it doesn't
+   * have block vars, since the affine flag depends on the outer scope of stmt.
+   */
+  TVM_DLL void UpdateScopeBlockInfo(const Stmt& stmt);
   /*!
    * \brief Get the BlockScope correpsonding to the sref of scope root block
    * \param scope_root The block sref to be retrieved
@@ -173,7 +197,7 @@ class ScheduleStateNode : public Object {
    * \return The corresponding BlockScope
    */
   bool IsStagePipeline(const StmtSRef& scope_root) const {
-    return GetBlockScope(scope_root)->stage_pipeline;
+    return GetBlockInfo(scope_root).stage_pipeline;
   }
 };
 
@@ -186,10 +210,11 @@ class ScheduleState : public ObjectRef {
   /*!
    * \brief Construct a schedule state from an IRModule
    * \param mod The IRModule to be scheduled
-   * \param debug_mode Do extra correctness checking after the class creation
+   * \param debug_mask Do extra correctness checking after the class creation
    * and each time after calling the Replace method.
+   * \param enable_check Whether enables prerequisite checks for schedule primitives.
    */
-  TVM_DLL explicit ScheduleState(IRModule mod, int debug_mode = 0);
+  TVM_DLL explicit ScheduleState(IRModule mod, int debug_mask = 0, bool enable_check = true);
 
   /*! \return The mutable pointer to the ScheduleStateNode */
   ScheduleStateNode* get() const { return static_cast<ScheduleStateNode*>(data_.get()); }

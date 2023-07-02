@@ -29,12 +29,14 @@
  * external functions, and they will use the provided compiler for codegen.
  */
 
-#include <tvm/ir/error.h>
+#include <tvm/ir/module.h>
 #include <tvm/relay/analysis.h>
 #include <tvm/relay/attrs/annotation.h>
+#include <tvm/relay/error.h>
 #include <tvm/relay/expr.h>
 #include <tvm/relay/expr_functor.h>
 #include <tvm/relay/transform.h>
+#include <tvm/runtime/name_transforms.h>
 
 #include <unordered_map>
 #include <unordered_set>
@@ -42,11 +44,13 @@
 #include <vector>
 
 #include "../analysis/annotated_region_set.h"
+#include "../backend/name_transforms.h"
 #include "../backend/utils.h"
 #include "pass_utils.h"
 
 namespace tvm {
 namespace relay {
+
 namespace partitioning {
 
 /*! \brief This struct maintains the required metadata for a region to generate a corresponding
@@ -112,7 +116,8 @@ struct RegionFuncMetadata {
 
 class Partitioner : public MixedModeMutator {
  public:
-  explicit Partitioner(const IRModule& module) : module_(module) {
+  Partitioner(const IRModule& module, bool bind_constants)
+      : module_(module), bind_constants_(bind_constants) {
     std::set<std::string> func_names;
     for (auto f : module->functions) {
       GlobalVar f_var = f.first;
@@ -208,10 +213,9 @@ class Partitioner : public MixedModeMutator {
   IRModule Partition() {
     auto glob_funcs = module_->functions;
     for (const auto& pair : glob_funcs) {
-      if (auto* fn = pair.second.as<FunctionNode>()) {
-        auto func = GetRef<Function>(fn);
-        func = Function(func->params, VisitExpr(func->body), func->ret_type, func->type_params,
-                        func->attrs);
+      if (auto opt = pair.second.as<Function>()) {
+        Function func = opt.value();
+        func = WithFields(func, func->params, VisitExpr(func->body));
         module_->Update(pair.first, func);
         module_ = transform::InferType()(module_);
       }
@@ -290,7 +294,7 @@ class Partitioner : public MixedModeMutator {
     Map<Var, Expr> params_bind;
     for (auto pair : region_func_meta_[region].args) {
       params.push_back(pair.first);
-      if (IsConstant(pair.second)) {
+      if (bind_constants_ && IsConstant(pair.second)) {
         params_bind.Set(pair.first, pair.second);
       } else {
         param_expr.push_back(pair.second);
@@ -330,14 +334,15 @@ class Partitioner : public MixedModeMutator {
         WithAttr(std::move(global_region_func), attr::kCompiler, tvm::runtime::String(target));
     global_region_func = WithAttr(std::move(global_region_func), attr::kInline, tvm::Integer(1));
 
-    std::string fname = name;
-    ICHECK(!module_->ContainGlobalVar(fname)) << "Global function " << fname << " already exists";
+    GlobalVarSupply global_var_supply = GlobalVarSupply(module_);
+    GlobalVar glob_func = global_var_supply->FreshGlobal(name, false);
+    ICHECK(!module_->ContainGlobalVar(glob_func->name_hint))
+        << "Global function " << glob_func->name_hint << " already exists";
     // Create a global function and add it to the IRModule for the region.
     // This way we lift the functions that should be handled by external
     // codegen to the module scope and rely on the pass manager to prevent
     // relay function level passes (i.e. simplify inference and fusion)
     // optimizing it.
-    GlobalVar glob_func(fname);
     module_->Add(glob_func, global_region_func);
     module_ = relay::transform::InferType()(module_);
 
@@ -398,6 +403,9 @@ class Partitioner : public MixedModeMutator {
 
   /*!\brief The IRModule used for partitioning. */
   IRModule module_;
+
+  /*!\brief Whether or not to bind constants in partitioned subgraphs. */
+  bool bind_constants_{false};
 };
 
 IRModule RemoveDefaultAnnotations(IRModule module) {
@@ -418,11 +426,11 @@ IRModule RemoveDefaultAnnotations(IRModule module) {
   // module is mutable, hence, we make a copy of it.
   module.CopyOnWrite();
   for (const auto& pair : glob_funcs) {
-    if (auto* fn = pair.second.as<FunctionNode>()) {
-      auto func = GetRef<Function>(fn);
+    if (auto opt = pair.second.as<Function>()) {
+      auto func = opt.value();
       DefaultRemover remover;
       auto removed = PostOrderRewrite(func->body, &remover);
-      func = Function(func->params, removed, func->ret_type, func->type_params, func->attrs);
+      func = WithFields(func, func->params, removed);
       module->Update(pair.first, func);
       module = relay::transform::InferType()(module);
     }
@@ -452,18 +460,18 @@ IRModule FlattenTupleOutputs(IRModule module) {
         // Arguments of annotation ops should be 1
         ICHECK_EQ(call->args.size(), 1U);
         auto annotated_op = Downcast<Call>(post)->args[0];
-        if (const auto* tn = annotated_op.as<TupleNode>()) {
+        if (const auto* tuple_node = annotated_op.as<TupleNode>()) {
           Array<Expr> new_fields;
+          new_fields.reserve(tuple_node->fields.size());
 
           // Here each input of the tuple will be annotated with compiler_ends
-          for (auto& tn_arg : tn->fields) {
+          for (auto& tn_arg : tuple_node->fields) {
             new_fields.push_back((*make_end_op)(tn_arg, target));
           }
 
           // Return a tuple of compiler_ends in the place of the tuple that was
           // annotated with a compiler_end.
-          auto out = Tuple(new_fields);
-          return std::move(out);
+          return WithFields(GetRef<Tuple>(tuple_node), new_fields);
         }
       }
       return post;
@@ -474,11 +482,11 @@ IRModule FlattenTupleOutputs(IRModule module) {
   // module is mutable, hence, we make a copy of it.
   module.CopyOnWrite();
   for (const auto& pair : glob_funcs) {
-    if (auto* fn = pair.second.as<FunctionNode>()) {
-      auto func = GetRef<Function>(fn);
+    if (auto opt = pair.second.as<Function>()) {
+      Function func = opt.value();
       TupleOutFlattener to_flattener;
       auto removed = PostOrderRewrite(func->body, &to_flattener);
-      func = Function(func->params, removed, func->ret_type, func->type_params, func->attrs);
+      func = WithFields(func, func->params, removed);
       module->Update(pair.first, func);
       module = relay::transform::InferType()(module);
     }
@@ -497,10 +505,10 @@ class NameMangleExtFuncs : public MixedModeMutator {
     // Collect function names to be mangled and create
     // global mangled variables
     for (const auto& pair : glob_funcs) {
-      if (auto* fn = pair.second.as<FunctionNode>()) {
-        auto func = GetRef<Function>(fn);
+      if (auto opt = pair.second.as<Function>()) {
+        auto func = opt.value();
         if (func->GetAttr<String>(attr::kCompiler).defined()) {
-          auto fn_name_mangled = mangle_fn_(pair.first->name_hint);
+          auto fn_name_mangled = tvm::runtime::SanitizeName(mangle_fn_(pair.first->name_hint));
           GlobalVar gvar = GlobalVar(fn_name_mangled);
           mangled_gvars_[pair.first->name_hint] = gvar;
         }
@@ -509,20 +517,23 @@ class NameMangleExtFuncs : public MixedModeMutator {
 
     // Walk the tree and mangle the functions. Then replace compiler functions
     // with mangled functions in the module
-    IRModule new_module = IRModule({}, module_->type_definitions, module_->Imports());
+    IRModule new_module = module_->ShallowCopy();
+    new_module->functions = {};
+
     for (const auto& pair : glob_funcs) {
-      if (auto* fn = pair.second.as<FunctionNode>()) {
-        auto func = GetRef<Function>(fn);
+      if (auto opt = pair.second.as<Function>()) {
+        auto func = opt.value();
 
         if (func->GetAttr<String>(attr::kCompiler).defined()) {
           auto new_dict = func->attrs->dict;
-          new_dict.Set(tvm::attr::kGlobalSymbol, String(mangle_fn_(pair.first->name_hint)));
-          func = Function(func->params, VisitExpr(func->body), func->ret_type, func->type_params,
-                          DictAttrs(new_dict));
+          new_dict.Set(tvm::attr::kGlobalSymbol,
+                       String(tvm::runtime::SanitizeName(mangle_fn_(pair.first->name_hint))));
+          func = WithFields(func, func->params, VisitExpr(func->body), func->ret_type,
+                            func->type_params, DictAttrs(new_dict));
+
           new_module->Add(mangled_gvars_[pair.first->name_hint], func);
         } else {
-          func = Function(func->params, VisitExpr(func->body), func->ret_type, func->type_params,
-                          func->attrs);
+          func = WithFields(func, func->params, VisitExpr(func->body));
           new_module->Add(pair.first, func);
         }
       }
@@ -556,7 +567,7 @@ class NameMangleExtFuncs : public MixedModeMutator {
 
 namespace transform {
 
-Pass PartitionGraph(String mod_name) {
+Pass PartitionGraph(String mod_name, bool bind_constants) {
   runtime::TypedPackedFunc<IRModule(IRModule, PassContext)> flatten_tuples = [=](IRModule m,
                                                                                  PassContext pc) {
     // There could be compiler_end annotations on tuples
@@ -575,8 +586,10 @@ Pass PartitionGraph(String mod_name) {
     return partitioning::RemoveDefaultAnnotations(m);
   };
 
-  runtime::TypedPackedFunc<IRModule(IRModule, PassContext)> part_func =
-      [=](IRModule m, PassContext pc) { return partitioning::Partitioner(m).Partition(); };
+  runtime::TypedPackedFunc<IRModule(IRModule, PassContext)> part_func = [=](IRModule m,
+                                                                            PassContext pc) {
+    return partitioning::Partitioner(m, bind_constants).Partition();
+  };
 
   auto name_mangling_fn = [mod_name](String name) {
     return runtime::get_name_mangled(mod_name, name);
@@ -595,9 +608,10 @@ Pass PartitionGraph(String mod_name) {
       {flatten_tuples_pass, remove_default_pass, partition_pass, name_mangling_pass, InferType()});
 }
 
-TVM_REGISTER_GLOBAL("relay._transform.PartitionGraph").set_body_typed([](String mod_name) {
-  return transform::PartitionGraph(mod_name);
-});
+TVM_REGISTER_GLOBAL("relay._transform.PartitionGraph")
+    .set_body_typed([](String mod_name, bool bind_constants) {
+      return transform::PartitionGraph(mod_name, bind_constants);
+    });
 
 }  // namespace transform
 

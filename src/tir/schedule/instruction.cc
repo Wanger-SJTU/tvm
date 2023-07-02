@@ -21,6 +21,11 @@
 namespace tvm {
 namespace tir {
 
+bool InstructionKindNode::IsPostproc() const {
+  static InstructionKind inst_enter_postproc = InstructionKind::Get("EnterPostproc");
+  return this == inst_enter_postproc.get();
+}
+
 Instruction::Instruction(InstructionKind kind, Array<ObjectRef> inputs, Array<ObjectRef> attrs,
                          Array<ObjectRef> outputs) {
   ObjectPtr<InstructionNode> n = make_object<InstructionNode>();
@@ -74,6 +79,8 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
           std::ostringstream os;
           os << new_expr;
           inputs.push_back(String(os.str()));
+        } else if (obj.as<IndexMapNode>()) {
+          inputs.push_back(obj);
         } else {
           LOG(FATAL) << "TypeError: Stringifying is not supported for type: " << obj->GetTypeKey();
           throw;

@@ -25,6 +25,7 @@
 
 #include <tvm/ir/type_functor.h>
 #include <tvm/node/structural_equal.h>
+#include <tvm/tir/expr_functor.h>
 #include <tvm/tir/op.h>
 
 #include <memory>
@@ -74,6 +75,19 @@ class TypeSolver::Reporter : public TypeReporterNode {
   mutable Span span;
 
   TypeSolver* solver_;
+};
+
+class TypeSolver::AnyChecker : public tir::ExprVisitor {
+ public:
+  void VisitExpr_(const AnyNode* op) final { found_ = true; }
+
+  bool Check(const PrimExpr& expr) {
+    tir::ExprVisitor::VisitExpr(expr);
+    return found_;
+  }
+
+ private:
+  bool found_{false};
 };
 
 class TypeSolver::OccursChecker : public TypeVisitor {
@@ -131,12 +145,11 @@ class TypeSolver::Unifier : public TypeFunctor<Type(const Type&, const Type&)> {
       Type resolved = this->VisitType(rhs->resolved_type, lhs->resolved_type);
 
       if (!resolved.defined()) {
-        solver_->diag_ctx_.Emit(
-            Diagnostic::Error(this->span)
-            << "The Relay type checker is unable to show the following types match.\n"
-            << "In particular "
-            << "`" << PrettyPrint(lhs->resolved_type) << "` does not match `"
-            << PrettyPrint(rhs->resolved_type) << "`");
+        solver_->Emit(Diagnostic::Error(this->span)
+                      << "The Relay type checker is unable to show the following types match.\n"
+                      << "In particular "
+                      << "`" << PrettyPrint(lhs->resolved_type) << "` does not match `"
+                      << PrettyPrint(rhs->resolved_type) << "`");
         return lhs->resolved_type;
       } else {
         TypeNode* top = solver_->GetTypeNode(resolved);
@@ -145,6 +158,11 @@ class TypeSolver::Unifier : public TypeFunctor<Type(const Type&, const Type&)> {
         return resolved;
       }
     }
+  }
+
+  bool HasAny(const PrimExpr& expr) {
+    AnyChecker ac;
+    return ac.Check(expr);
   }
 
   // Checks whether lhs (taken to be a type var) occurs in t, meaning
@@ -161,7 +179,7 @@ class TypeSolver::Unifier : public TypeFunctor<Type(const Type&, const Type&)> {
   // default: unify only if structural-equal
   Type VisitTypeDefault_(const Object* op, const Type& tn) final {
     ObjectRef nr = GetRef<ObjectRef>(op);
-    Type t1 = GetRef<Type>(nr.as<tvm::relay::TypeNode>());
+    Type t1 = Downcast<Type>(nr);
     if (!tvm::StructuralEqual()(t1, tn)) {
       return Type(nullptr);
     }
@@ -187,7 +205,7 @@ class TypeSolver::Unifier : public TypeFunctor<Type(const Type&, const Type&)> {
     if (ulhs.same_as(urhs)) {
       return ulhs;
     }
-    if (ulhs.as<AnyNode>() || urhs.as<AnyNode>()) {
+    if (HasAny(ulhs) || HasAny(urhs)) {
       return Any();
     }
 
@@ -233,11 +251,10 @@ class TypeSolver::Unifier : public TypeFunctor<Type(const Type&, const Type&)> {
 
     tvm::Array<IndexExpr> shape;
     if (tt1->shape.size() != tt2->shape.size()) {
-      this->solver_->diag_ctx_.Emit(Diagnostic::Error(this->span)
-                                    << "tensor type `" << PrettyPrint(tt1) << "` has "
-                                    << tt1->shape.size() << " dimensions, while `"
-                                    << PrettyPrint(tt2) << "` has " << tt2->shape.size()
-                                    << " dimensions");
+      this->solver_->Emit(Diagnostic::Error(this->span)
+                          << "tensor type `" << PrettyPrint(tt1) << "` has " << tt1->shape.size()
+                          << " dimensions, while `" << PrettyPrint(tt2) << "` has "
+                          << tt2->shape.size() << " dimensions");
       return Type(nullptr);
     }
 
@@ -260,13 +277,15 @@ class TypeSolver::Unifier : public TypeFunctor<Type(const Type&, const Type&)> {
 
     if (mismatches.size() != 0) {
       auto err = Diagnostic::Error(this->span);
-      err << "The Relay type checker is unable to show the following types match.\n";
-      err << "In particular ";
+      err << "The Relay type checker is unable to show the following types match:\n"
+          << "  " << PrettyPrint(tt1) << "\n"
+          << "  " << PrettyPrint(tt2) << "\n";
+      err << "In particular:\n";
       for (auto mismatch : mismatches) {
-        err << "dimension " << std::get<0>(mismatch) << " conflicts: " << std::get<1>(mismatch)
+        err << "  dimension " << std::get<0>(mismatch) << " conflicts: " << std::get<1>(mismatch)
             << " does not match " << std::get<2>(mismatch) << ".";
       }
-      this->solver_->diag_ctx_.Emit(err);
+      this->solver_->Emit(err);
       return Type(nullptr);
     }
 
@@ -405,7 +424,7 @@ class TypeSolver::Propagator : public TypeFunctor<void(const Type&)> {
 
   void VisitTypeDefault_(const Object* op) override {
     ObjectRef nr = GetRef<ObjectRef>(op);
-    Type t = GetRef<Type>(nr.as<tvm::relay::TypeNode>());
+    Type t = Downcast<Type>(nr);
     UpdateRelSet(t);
   }
 
@@ -489,7 +508,7 @@ class TypeSolver::Merger : public TypeFunctor<void(const Type&)> {
 
   void VisitTypeDefault_(const Object* op) override {
     ObjectRef nr = GetRef<ObjectRef>(op);
-    Type t = GetRef<Type>(nr.as<tvm::relay::TypeNode>());
+    Type t = Downcast<Type>(nr);
     TransferLinks(t);
   }
 
@@ -526,7 +545,7 @@ class TypeSolver::Merger : public TypeFunctor<void(const Type&)> {
 // constructor
 TypeSolver::TypeSolver(const GlobalVar& current_func, DiagnosticContext diag_ctx)
     : reporter_(make_object<Reporter>(this)),
-      current_func(current_func),
+      current_func_(current_func),
       diag_ctx_(diag_ctx),
       module_(diag_ctx->module) {
   ICHECK(module_.defined());
@@ -618,7 +637,7 @@ bool TypeSolver::Solve() {
 
       rnode->resolved = resolved;
     } catch (const CompileError& err) {
-      this->diag_ctx_.Emit(Diagnostic::Error(rnode->span) << err.what());
+      this->Emit(Diagnostic::Error(rnode->span) << err.what());
       rnode->resolved = false;
     } catch (const Error& e) {
       ICHECK(false) << e.what();

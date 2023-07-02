@@ -27,20 +27,48 @@
 #include <algorithm>
 #include <vector>
 
+#include "../../../../3rdparty/compiler-rt/builtin_fp16.h"
+
 namespace tvm {
 namespace contrib {
 
 using namespace runtime;
 
-template <typename DType>
+template <typename DType, bool stable_comparison = false>
 bool CompareAscend(const std::pair<int64_t, DType>& lhs, const std::pair<int64_t, DType>& rhs) {
+  if constexpr (stable_comparison) {
+    if (lhs.second == rhs.second) {
+      return lhs.first < rhs.first;
+    }
+  }
+
   return lhs.second < rhs.second;
 }
 
-template <typename DType>
+template <typename DType, bool stable_comparison = false>
 bool CompareDescend(const std::pair<int64_t, DType>& lhs, const std::pair<int64_t, DType>& rhs) {
+  if constexpr (stable_comparison) {
+    if (lhs.second == rhs.second) {
+      return lhs.first < rhs.first;
+    }
+  }
+
   return lhs.second > rhs.second;
 }
+
+struct float16 {
+  uint16_t bits;
+  float to_float() const {
+    return __extendXfYf2__<uint16_t, uint16_t, 10, float, uint32_t, 23>(bits);
+  }
+
+  inline bool operator==(const float16& rhs) const { return to_float() == rhs.to_float(); }
+  inline bool operator!=(const float16& rhs) const { return to_float() != rhs.to_float(); }
+  inline bool operator<(const float16& rhs) const { return to_float() < rhs.to_float(); }
+  inline bool operator>(const float16& rhs) const { return to_float() > rhs.to_float(); }
+  inline bool operator<=(const float16& rhs) const { return to_float() <= rhs.to_float(); }
+  inline bool operator>=(const float16& rhs) const { return to_float() >= rhs.to_float(); }
+};
 
 // Argsort implemented C library sort for nms.
 // Return indices of sorted tensor.
@@ -125,7 +153,9 @@ TVM_REGISTER_GLOBAL("tvm.contrib.sort.argsort_nms").set_body([](TVMArgs args, TV
 });
 
 template <typename DataType, typename OutType>
-void sort_impl(DLTensor* input, DLTensor* output, int32_t axis, bool is_ascend, bool is_argsort) {
+void sort_impl(
+    DLTensor* input, DLTensor* output, int32_t axis, bool is_ascend,
+    std::function<void(OutType*, size_t, const std::pair<int64_t, DataType>&)> epilogue) {
   auto data_ptr = static_cast<DataType*>(input->data);
   auto out_ptr = static_cast<OutType*>(output->data);
   std::vector<std::pair<int64_t, DataType>> sorter;
@@ -153,14 +183,8 @@ void sort_impl(DLTensor* input, DLTensor* output, int32_t axis, bool is_ascend, 
       } else {
         std::stable_sort(sorter.begin(), sorter.end(), CompareDescend<DataType>);
       }
-      if (is_argsort) {
-        for (int64_t k = 0; k < input->shape[axis]; ++k) {
-          out_ptr[base_idx + k * axis_mul_after] = static_cast<OutType>(sorter[k].first);
-        }
-      } else {
-        for (int64_t k = 0; k < input->shape[axis]; ++k) {
-          out_ptr[base_idx + k * axis_mul_after] = static_cast<OutType>(sorter[k].second);
-        }
+      for (int64_t k = 0; k < input->shape[axis]; ++k) {
+        epilogue(out_ptr, base_idx + k * axis_mul_after, sorter[k]);
       }
     }
   }
@@ -168,12 +192,20 @@ void sort_impl(DLTensor* input, DLTensor* output, int32_t axis, bool is_ascend, 
 
 template <typename DataType, typename OutType>
 void argsort(DLTensor* input, DLTensor* output, int32_t axis, bool is_ascend) {
-  return sort_impl<DataType, OutType>(input, output, axis, is_ascend, true);
+  return sort_impl<DataType, OutType>(
+      input, output, axis, is_ascend,
+      [](OutType* out_ptr, size_t index, const std::pair<int64_t, DataType>& sort_pair) {
+        out_ptr[index] = static_cast<OutType>(sort_pair.first);
+      });
 }
 
 template <typename DataType>
 void sort(DLTensor* input, DLTensor* output, int32_t axis, bool is_ascend) {
-  return sort_impl<DataType, DataType>(input, output, axis, is_ascend, false);
+  return sort_impl<DataType, DataType>(
+      input, output, axis, is_ascend,
+      [](DataType* out_ptr, size_t index, const std::pair<int64_t, DataType>& sort_pair) {
+        out_ptr[index] = sort_pair.second;
+      });
 }
 
 // Argsort implemented C library sort.
@@ -254,6 +286,18 @@ TVM_REGISTER_GLOBAL("tvm.contrib.sort.argsort").set_body([](TVMArgs args, TVMRet
     } else {
       LOG(FATAL) << "Unsupported output dtype: " << out_dtype;
     }
+  } else if (data_dtype == "float16") {
+    if (out_dtype == "int32") {
+      argsort<float16, int32_t>(input, output, axis, is_ascend);
+    } else if (out_dtype == "int64") {
+      argsort<float16, int64_t>(input, output, axis, is_ascend);
+    } else if (out_dtype == "float32") {
+      argsort<float16, float>(input, output, axis, is_ascend);
+    } else if (out_dtype == "float64") {
+      argsort<float16, double>(input, output, axis, is_ascend);
+    } else {
+      LOG(FATAL) << "Unsupported output dtype: " << out_dtype;
+    }
   } else {
     LOG(FATAL) << "Unsupported input dtype: " << data_dtype;
   }
@@ -295,6 +339,8 @@ TVM_REGISTER_GLOBAL("tvm.contrib.sort.sort").set_body([](TVMArgs args, TVMRetVal
     sort<int32_t>(input, output, axis, is_ascend);
   } else if (data_dtype == "int64") {
     sort<int64_t>(input, output, axis, is_ascend);
+  } else if (data_dtype == "float16") {
+    sort<float16>(input, output, axis, is_ascend);
   } else {
     LOG(FATAL) << "Unsupported input dtype: " << data_dtype;
   }
@@ -308,7 +354,12 @@ void topk(DLTensor* input, DLTensor* out_values, DLTensor* out_indices, int k, i
       (out_values == nullptr) ? nullptr : static_cast<DataType*>(out_values->data);
   IndicesType* indices_ptr =
       (out_indices == nullptr) ? nullptr : static_cast<IndicesType*>(out_indices->data);
-  std::vector<std::pair<int64_t, DataType>> sorter;
+
+  // Maintain a min/max containing the top-k elements
+  std::vector<std::pair<int64_t, DataType>> running_heap;
+
+  // Need +1 when inserting new element before maintaining heap invariant
+  running_heap.reserve(k + 1);
 
   int axis_mul_before = 1;
   int axis_mul_after = 1;
@@ -325,26 +376,56 @@ void topk(DLTensor* input, DLTensor* out_values, DLTensor* out_indices, int k, i
 
   for (int i = 0; i < axis_mul_before; ++i) {
     for (int j = 0; j < axis_mul_after; ++j) {
-      sorter.clear();
+      running_heap.clear();
       int64_t src_base_idx = i * input->shape[axis] * axis_mul_after + j;
       int64_t dst_base_idx = i * k * axis_mul_after + j;
-      for (int64_t kk = 0; kk < input->shape[axis]; ++kk) {
-        int64_t full_idx = src_base_idx + kk * axis_mul_after;
-        sorter.emplace_back(std::make_pair(kk, data_ptr[full_idx]));
+
+      // Start by creating min/max heap with fixed-k elements
+      int cur_axis_index = 0;
+      for (; cur_axis_index < k && cur_axis_index < input->shape[axis]; cur_axis_index++) {
+        int64_t full_idx = src_base_idx + cur_axis_index * axis_mul_after;
+        running_heap.emplace_back(std::make_pair(cur_axis_index, data_ptr[full_idx]));
       }
-      if (is_ascend) {
-        std::stable_sort(sorter.begin(), sorter.end(), CompareAscend<DataType>);
+      if (!is_ascend) {
+        std::make_heap(running_heap.begin(), running_heap.end(), CompareDescend<DataType, true>);
       } else {
-        std::stable_sort(sorter.begin(), sorter.end(), CompareDescend<DataType>);
+        std::make_heap(running_heap.begin(), running_heap.end(), CompareAscend<DataType, true>);
       }
-      int64_t cnt = k > 0 ? k : input->shape[axis];
-      for (int64_t kk = 0; kk < cnt; ++kk) {
+
+      // Iterate through all elements, adding to heap along the way
+      for (; cur_axis_index < input->shape[axis]; cur_axis_index++) {
+        int64_t full_idx = src_base_idx + cur_axis_index * axis_mul_after;
+        std::pair<int64_t, DataType> cur_val = {cur_axis_index, data_ptr[full_idx]};
+
+        // Eq. to cur_val.second > running_heap.second
+        if (!is_ascend && CompareDescend<DataType, true>(cur_val, running_heap[0])) {
+          running_heap.push_back(cur_val);
+          std::push_heap(running_heap.begin(), running_heap.end(), CompareDescend<DataType, true>);
+          std::pop_heap(running_heap.begin(), running_heap.end(), CompareDescend<DataType, true>);
+          running_heap.pop_back();
+        } else if (is_ascend && CompareAscend<DataType, true>(cur_val, running_heap[0])) {
+          running_heap.push_back(cur_val);
+          std::push_heap(running_heap.begin(), running_heap.end(), CompareAscend<DataType, true>);
+          std::pop_heap(running_heap.begin(), running_heap.end(), CompareAscend<DataType, true>);
+          running_heap.pop_back();
+        }
+      }
+
+      // finally sort heap and deliver results
+      if (is_ascend) {
+        std::stable_sort(running_heap.begin(), running_heap.end(), CompareAscend<DataType, true>);
+      } else {
+        std::stable_sort(running_heap.begin(), running_heap.end(), CompareDescend<DataType, true>);
+      }
+
+      for (uint32_t kk = 0; kk < running_heap.size(); ++kk) {
         if (indices_ptr != nullptr) {
           indices_ptr[dst_base_idx + kk * axis_mul_after] =
-              static_cast<IndicesType>(sorter[kk].first);
+              static_cast<IndicesType>(running_heap[kk].first);
         }
         if (values_ptr != nullptr) {
-          values_ptr[dst_base_idx + kk * axis_mul_after] = static_cast<DataType>(sorter[kk].second);
+          values_ptr[dst_base_idx + kk * axis_mul_after] =
+              static_cast<DataType>(running_heap[kk].second);
         }
       }
     }
@@ -408,6 +489,34 @@ TVM_REGISTER_GLOBAL("tvm.contrib.sort.topk").set_body([](TVMArgs args, TVMRetVal
     } else {
       LOG(FATAL) << "Unsupported output dtype: " << out_dtype;
     }
+  } else if (data_dtype == "uint8") {
+    if (out_dtype == "uint8") {
+      topk<uint8_t, uint8_t>(input, values_out, indices_out, k, axis, is_ascend);
+    } else if (out_dtype == "int32") {
+      topk<uint8_t, int32_t>(input, values_out, indices_out, k, axis, is_ascend);
+    } else if (out_dtype == "int64") {
+      topk<uint8_t, int64_t>(input, values_out, indices_out, k, axis, is_ascend);
+    } else if (out_dtype == "float32") {
+      topk<uint8_t, float>(input, values_out, indices_out, k, axis, is_ascend);
+    } else if (out_dtype == "float64") {
+      topk<uint8_t, double>(input, values_out, indices_out, k, axis, is_ascend);
+    } else {
+      LOG(FATAL) << "Unsupported output dtype: " << out_dtype;
+    }
+  } else if (data_dtype == "int8") {
+    if (out_dtype == "int8") {
+      topk<int8_t, int8_t>(input, values_out, indices_out, k, axis, is_ascend);
+    } else if (out_dtype == "int32") {
+      topk<int8_t, int32_t>(input, values_out, indices_out, k, axis, is_ascend);
+    } else if (out_dtype == "int64") {
+      topk<int8_t, int64_t>(input, values_out, indices_out, k, axis, is_ascend);
+    } else if (out_dtype == "float32") {
+      topk<int8_t, float>(input, values_out, indices_out, k, axis, is_ascend);
+    } else if (out_dtype == "float64") {
+      topk<int8_t, double>(input, values_out, indices_out, k, axis, is_ascend);
+    } else {
+      LOG(FATAL) << "Unsupported output dtype: " << out_dtype;
+    }
   } else if (data_dtype == "int32") {
     if (out_dtype == "int32") {
       topk<int32_t, int32_t>(input, values_out, indices_out, k, axis, is_ascend);
@@ -429,6 +538,18 @@ TVM_REGISTER_GLOBAL("tvm.contrib.sort.topk").set_body([](TVMArgs args, TVMRetVal
       topk<int64_t, float>(input, values_out, indices_out, k, axis, is_ascend);
     } else if (out_dtype == "float64") {
       topk<int64_t, double>(input, values_out, indices_out, k, axis, is_ascend);
+    } else {
+      LOG(FATAL) << "Unsupported output dtype: " << out_dtype;
+    }
+  } else if (data_dtype == "float16") {
+    if (out_dtype == "int32") {
+      topk<float16, int32_t>(input, values_out, indices_out, k, axis, is_ascend);
+    } else if (out_dtype == "int64") {
+      topk<float16, int64_t>(input, values_out, indices_out, k, axis, is_ascend);
+    } else if (out_dtype == "float32") {
+      topk<float16, float>(input, values_out, indices_out, k, axis, is_ascend);
+    } else if (out_dtype == "float64") {
+      topk<float16, double>(input, values_out, indices_out, k, axis, is_ascend);
     } else {
       LOG(FATAL) << "Unsupported output dtype: " << out_dtype;
     }

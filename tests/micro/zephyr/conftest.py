@@ -14,66 +14,40 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+pytest_plugins = [
+    "tvm.micro.testing.pytest_plugin",
+]
+
 import pytest
-
-import tvm.target.target
-
-# The models that should pass this configuration. Maps a short, identifying platform string to
-# (model, zephyr_board).
-PLATFORMS = {
-    "host": ("host", "qemu_x86"),
-    "host_riscv32": ("host", "qemu_riscv32"),
-    "host_riscv64": ("host", "qemu_riscv64"),
-    "mps2_an521": ("mps2_an521", "mps2_an521-qemu"),
-    "nrf5340dk": ("nrf5340dk", "nrf5340dk_nrf5340_cpuapp"),
-    "stm32f746xx_disco": ("stm32f746xx", "stm32f746g_disco"),
-    "stm32f746xx_nucleo": ("stm32f746xx", "nucleo_f746zg"),
-    "stm32l4r5zi_nucleo": ("stm32l4r5zi", "nucleo_l4r5zi"),
-    "zynq_mp_r5": ("zynq_mp_r5", "qemu_cortex_r5"),
-}
 
 
 def pytest_addoption(parser):
     parser.addoption(
-        "--microtvm-platforms",
-        default="host",
-        choices=PLATFORMS.keys(),
-        help=(
-            "Specify a comma-separated list of test models (i.e. as passed to tvm.target.micro()) "
-            "for microTVM tests."
-        ),
-    )
-    parser.addoption(
-        "--west-cmd", default="west", help="Path to `west` command for flashing device."
-    )
-    parser.addoption(
-        "--skip-build",
-        action="store_true",
-        help="If set true, reuses build from the previous test run. Otherwise, build from the scratch.",
-    )
-    parser.addoption(
-        "--tvm-debug",
+        "--use-fvp",
         action="store_true",
         default=False,
-        help="If set true, enable a debug session while the test is running. Before running the test, in a separate shell, you should run: <python -m tvm.exec.microtvm_debug_shell>",
+        help="If set true, use the FVP emulator to run the test",
     )
 
 
-def pytest_generate_tests(metafunc):
-    if "platform" in metafunc.fixturenames:
-        metafunc.parametrize("platform", metafunc.config.getoption("microtvm_platforms").split(","))
-
-
 @pytest.fixture
-def west_cmd(request):
-    return request.config.getoption("--west-cmd")
+def use_fvp(request):
+    return request.config.getoption("--use-fvp")
 
 
-@pytest.fixture
-def skip_build(request):
-    return request.config.getoption("--skip-build")
+@pytest.fixture(autouse=True)
+def xfail_on_fvp(request, use_fvp):
+    """mark the tests as xfail if running on fvp."""
+    if request.node.get_closest_marker("xfail_on_fvp"):
+        if use_fvp:
+            request.node.add_marker(
+                pytest.mark.xfail(reason="checking corstone300 reliability on CI")
+            )
 
 
-@pytest.fixture
-def tvm_debug(request):
-    return request.config.getoption("--tvm-debug")
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "xfail_on_fvp(): mark test as xfail on fvp",
+    )

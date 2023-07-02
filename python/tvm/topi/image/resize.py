@@ -23,6 +23,22 @@ from tvm.topi.utils import nchw_pack_layout, nchw_xc_layout
 from .. import tag
 
 
+def can_convert_multiply_to_intdiv(origin_size, scaled_size):
+    """Check whether can convert multiplication to division"""
+    # Only support IntImm type
+    if not isinstance(scaled_size, tvm.tir.expr.IntImm):
+        return False
+
+    div = scaled_size / origin_size.astype("float")
+    if div.value % 1 != 0:
+        return False
+    epsilon = 1e-5
+    check = 1 / (epsilon * origin_size + epsilon)
+    if div > check:
+        return False
+    return True
+
+
 def get_1d_indices(indices, layout="NCW"):
     """Get 1d indices"""
     (cc, inum, ic) = (0, 0, 0)
@@ -119,7 +135,15 @@ def get_3d_pixel(data, layout, image_depth, image_height, image_width, n, c, z, 
     return data(n, c, z, y, x, cc).astype("float")
 
 
-def get_inx(x, image_width, target_width, coordinate_transformation_mode):
+def get_inx(
+    x,
+    image_width,
+    target_width,
+    coordinate_transformation_mode,
+    start_x=0,
+    end_x=-1,
+    use_int_div=False,
+):
     """Infer input x from output x with various coordinate transformation methods"""
     scale_x = te.div(image_width.astype("float"), target_width.astype("float"))
     if coordinate_transformation_mode == "half_pixel":
@@ -127,20 +151,34 @@ def get_inx(x, image_width, target_width, coordinate_transformation_mode):
     elif coordinate_transformation_mode == "align_corners":
         in_x = (image_width - 1).astype("float") / (target_width - 1) * x
     elif coordinate_transformation_mode == "asymmetric":
-        in_x = scale_x * x
+        if use_int_div:
+            in_x = te.div(x, te.div(target_width, image_width))
+        else:
+            in_x = scale_x * x
     elif coordinate_transformation_mode == "pytorch_half_pixel":
         in_x = te.if_then_else(target_width > 1, (x + 0.5) * scale_x - 0.5, 0.0)
     elif coordinate_transformation_mode == "tf_half_pixel_for_nn":
         in_x = (x + 0.5) * scale_x
+    elif coordinate_transformation_mode == "tf_crop_and_resize":
+        in_x = te.if_then_else(
+            target_width > 1,
+            start_x * (image_width - 1)
+            + x * (end_x - start_x) * (image_width - 1).astype("float") / (target_width - 1),
+            0.5 * (start_x + end_x) * (image_width - 1),
+        )
     else:
         raise ValueError(
-            "Unsupported coordinate_transformation_mode: {}".format(coordinate_transformation_mode)
+            f"Unsupported coordinate_transformation_mode: {coordinate_transformation_mode}"
         )
     return in_x
 
 
-def get_closest_index(in_x, rounding_method, boxes):
+def get_closest_index(in_x, rounding_method, boxes, use_int_div=False):
     """get the closest index to a value based on a certain rounding method"""
+    if use_int_div:
+        closest_x_index = in_x.astype("int32")
+        return closest_x_index
+
     if rounding_method == "round" or boxes is not None:
         closest_x_index = te.round(in_x).astype("int32")
     elif rounding_method == "round_prefer_floor":
@@ -156,7 +194,7 @@ def get_closest_index(in_x, rounding_method, boxes):
         epsilon = 1e-5
         closest_x_index = te.ceil(in_x - epsilon).astype("int32")
     else:
-        raise ValueError("Uknown rounding method: {}".format(rounding_method))
+        raise ValueError(f"Unknown rounding method: {rounding_method}")
     return closest_x_index
 
 
@@ -184,12 +222,13 @@ def _cubic_kernel(inputs, w):
 def _resize_1d(
     indices,
     data,
+    roi,
     image_width,
     target_width,
     boxes=None,
     box_indices=None,
     method=None,
-    extrapolation_value=None,
+    extrapolation_value=0.0,
     layout="NCW",
     coordinate_transformation_mode="align_corners",
     rounding_method="",
@@ -209,6 +248,11 @@ def _resize_1d(
         inputs is a 3-D tensor with shape
         [batch, channel, in_width]
         or  [batch, in_width, channel]
+
+    roi: Tuple of Float or Expr
+        The region of interest for cropping the input image. Expected to be of
+        size 2, and format [start_w, end_w].
+        Only used if coordinate_transformation_mode is tf_crop_and_resize.
 
     image_width : integer
         Input image width
@@ -230,11 +274,14 @@ def _resize_1d(
     layout: string, optional
         "NCW", "NWC", or "NCWc".
 
-    coordinate_transformation_mode: string, optional
+    method: string, optional
+        method of interpolation ("nearest", "linear", "bicubic")
+
+    coordinate_transformation_mode : string, optional
         Describes how to transform the coordinate in the resized tensor
         to the coordinate in the original tensor.
-        Refer to the ONNX Resize operator specification for details.
-        Available options are "half_pixel", "align_corners" and "asymmetric".
+        [half_pixel, align_corners, asymmetric, pytorch_half_pixel,
+        tf_half_pixel_for_nn, and tf_crop_and_resize].
 
     rounding_method: string, optional
         indicates how to find the "nearest" pixel in nearest_neighbor method
@@ -243,7 +290,7 @@ def _resize_1d(
     alpha: float, optional
         Bicubic spline coefficient
 
-    exclude_oiutside: bool, optional:
+    exclude_outside: bool, optional:
         Exclude values outside the image fdor bicubic interpolation
 
     out_dtype: string, optional
@@ -267,12 +314,7 @@ def _resize_1d(
     if boxes is not None:
         # TODO(mbrookhart): Find an example of this
         raise NotImplementedError("resize1d with image boxes not yet implemented")
-    in_x = get_inx(
-        x,
-        image_width,
-        target_width,
-        coordinate_transformation_mode,
-    )
+    in_x = get_inx(x, image_width, target_width, coordinate_transformation_mode, roi[0], roi[1])
 
     if method == "nearest_neighbor":
         if rounding_method == "":
@@ -283,17 +325,7 @@ def _resize_1d(
 
         closest_x_index = get_closest_index(in_x, rounding_method, boxes)
 
-        value = get_1d_pixel(
-            data,
-            layout,
-            image_width,
-            box_idx,
-            c,
-            closest_x_index,
-            cc,
-            inum,
-            ic,
-        )
+        value = get_1d_pixel(data, layout, image_width, box_idx, c, closest_x_index, cc, inum, ic)
     elif method == "linear":
         x_int = te.floor(in_x).astype("int32")
 
@@ -301,17 +333,7 @@ def _resize_1d(
 
         p = [0 for i in range(2)]
         for i in range(2):
-            p[i] = get_1d_pixel(
-                data,
-                layout,
-                image_width,
-                box_idx,
-                c,
-                x_int + i,
-                cc,
-                inum,
-                ic,
-            )
+            p[i] = get_1d_pixel(data, layout, image_width, box_idx, c, x_int + i, cc, inum, ic)
 
         value = _lerp(*p, x_lerp)
 
@@ -322,17 +344,7 @@ def _resize_1d(
         # Get the surrounding values
         p = [0 for i in range(4)]
         for i in range(4):
-            p[i] = get_1d_pixel(
-                data,
-                layout,
-                image_width,
-                box_idx,
-                c,
-                xint + i - 1,
-                cc,
-                inum,
-                ic,
-            )
+            p[i] = get_1d_pixel(data, layout, image_width, box_idx, c, xint + i - 1, cc, inum, ic)
 
         wx = _cubic_spline_weights(xfract, alpha)
         if exclude_outside:
@@ -347,7 +359,7 @@ def _resize_1d(
     else:
         raise ValueError("Unknown resize method:", method)
 
-    if extrapolation_value is not None:
+    if coordinate_transformation_mode == "tf_crop_and_resize":
         # use extrapolation_value if in_x is out of boundary
         value = tvm.tir.if_then_else(
             in_x < 0,
@@ -359,6 +371,7 @@ def _resize_1d(
 
 def resize1d(
     data,
+    roi,
     size,
     layout="NCW",
     method="linear",
@@ -366,6 +379,7 @@ def resize1d(
     rounding_method="",
     bicubic_alpha=-0.5,
     bicubic_exclude=0,
+    extrapolation_value=0.0,
     out_dtype=None,
     output_shape=None,
 ):
@@ -377,6 +391,11 @@ def resize1d(
         inputs is a 3-D tensor with shape
         [batch, channel in_width]
         or  [batch in_width, channel]
+
+    roi: Tuple of Float or Expr
+        The region of interest for cropping the input image. Expected to be of
+        size 2, and format [start_w, end_w].
+        Only used if coordinate_transformation_mode is tf_crop_and_resize.
 
     size: Tuple
         Output resolution scale to
@@ -390,8 +409,26 @@ def resize1d(
         Refer to the ONNX Resize operator specification for details.
         Available options are "half_pixel", "align_corners" and "asymmetric".
 
-    method: {"linear", "nearest_neighbor", "cubic"}
-        Method to be used for resizing.
+    method: string, optional
+        method of interpolation ("nearest", "linear", "bicubic")
+
+    coordinate_transformation_mode : string, optional
+        Describes how to transform the coordinate in the resized tensor
+        to the coordinate in the original tensor.
+        [half_pixel, align_corners, asymmetric, pytorch_half_pixel,
+        tf_half_pixel_for_nn, and tf_crop_and_resize].
+
+    rounding_method:
+        Method for rounding coordinate locations
+
+    bicubic_alpha: float, optional
+        Bicubic spline coefficient
+
+    bicubic_exclude: bool, optional:
+        Exclude values outside the image fdor bicubic interpolation
+
+    extrapolation_value: float, optional
+        Value used for extrapolation, when applicable.
 
     out_dtype: string, optional
         Type to return. If left None will be same as input type.
@@ -425,7 +462,7 @@ def resize1d(
         if output_shape is None:
             output_shape = [in_n, in_c, size[0], in_cc]
     else:
-        raise ValueError("%s layout is not supported." % layout)
+        raise ValueError(f"{layout} layout is not supported.")
 
     if isinstance(size, tuple):
         size = list(size)
@@ -438,6 +475,7 @@ def resize1d(
         return _resize_1d(
             indices,
             data,
+            roi,
             in_w,
             size[0],
             method=method,
@@ -446,6 +484,7 @@ def resize1d(
             rounding_method=rounding_method,
             alpha=bicubic_alpha,
             exclude_outside=bicubic_exclude,
+            extrapolation_value=extrapolation_value,
             out_dtype=out_dtype,
         )
 
@@ -455,6 +494,7 @@ def resize1d(
 def _resize_2d(
     indices,
     data,
+    roi,
     image_height,
     image_width,
     target_height,
@@ -462,7 +502,7 @@ def _resize_2d(
     boxes=None,
     box_indices=None,
     method=None,
-    extrapolation_value=None,
+    extrapolation_value=0.0,
     layout="NCHW",
     coordinate_transformation_mode="align_corners",
     rounding_method="",
@@ -483,6 +523,11 @@ def _resize_2d(
         [batch, channel, in_height, in_width]
         or  [batch, in_height, in_width, channel]
 
+    roi: Tuple of Float or Expr
+        The region of interest for cropping the input image. Expected to be of
+        size 4, and format [start_h, start_w, end_h, end_w].
+        Only used if coordinate_transformation_mode is tf_crop_and_resize.
+
     image_height : integer
         Input image height
 
@@ -499,6 +544,9 @@ def _resize_2d(
         A 2-D tensor of shape [num_boxes, 4]. Each row of the tensor specifies
         the coordinates of a box.
 
+    method: string, optional
+        method of interpolation ("nearest", "linear", "bicubic")
+
     box_indices : tvm.te.Tensor, optional
         A 1-D tensor of shape [num_boxes], box_indices[i] specifies the data that
         the i-th box refers to.
@@ -509,11 +557,11 @@ def _resize_2d(
     layout: string, optional
         "NCHW", "NHWC", or "NCHWc".
 
-    coordinate_transformation_mode: string, optional
+    coordinate_transformation_mode : string, optional
         Describes how to transform the coordinate in the resized tensor
         to the coordinate in the original tensor.
-        Refer to the ONNX Resize operator specification for details.
-        Available options are "half_pixel", "align_corners" and "asymmetric".
+        [half_pixel, align_corners, asymmetric, pytorch_half_pixel,
+        tf_half_pixel_for_nn, and tf_crop_and_resize].
 
     rounding_method: string, optional
         indicates how to find the "nearest" pixel in nearest_neighbor method
@@ -522,7 +570,7 @@ def _resize_2d(
     alpha: float, optional
         Bicubic spline coefficient
 
-    exclude_oiutside: bool, optional:
+    exclude_outside: bool, optional:
         Exclude values outside the image fdor bicubic interpolation
 
     out_dtype: string, optional
@@ -541,6 +589,12 @@ def _resize_2d(
             dtype = data_dtype
         return value.astype(dtype)
 
+    height_use_int_div = False
+    width_use_int_div = False
+    if method == "nearest_neighbor" and coordinate_transformation_mode == "asymmetric":
+        height_use_int_div = can_convert_multiply_to_intdiv(image_height, target_height)
+        width_use_int_div = can_convert_multiply_to_intdiv(image_width, target_width)
+
     n, c, y, x, cc, inum, ic = get_2d_indices(indices, layout)
     box_idx = box_indices(n) if box_indices is not None else n
     if boxes is not None:
@@ -555,8 +609,24 @@ def _resize_2d(
         in_y = y1 * (image_height - 1) + h_scale * y
         in_x = x1 * (image_width - 1) + w_scale * x
     else:
-        in_x = get_inx(x, image_width, target_width, coordinate_transformation_mode)
-        in_y = get_inx(y, image_height, target_height, coordinate_transformation_mode)
+        in_x = get_inx(
+            x,
+            image_width,
+            target_width,
+            coordinate_transformation_mode,
+            roi[1],
+            roi[3],
+            width_use_int_div,
+        )
+        in_y = get_inx(
+            y,
+            image_height,
+            target_height,
+            coordinate_transformation_mode,
+            roi[0],
+            roi[2],
+            height_use_int_div,
+        )
 
     if method == "nearest_neighbor":
         if rounding_method == "":
@@ -565,8 +635,8 @@ def _resize_2d(
             else:
                 rounding_method = "floor"
 
-        closest_x_index = get_closest_index(in_x, rounding_method, boxes)
-        closest_y_index = get_closest_index(in_y, rounding_method, boxes)
+        closest_x_index = get_closest_index(in_x, rounding_method, boxes, width_use_int_div)
+        closest_y_index = get_closest_index(in_y, rounding_method, boxes, height_use_int_div)
 
         value = get_2d_pixel(
             data,
@@ -657,7 +727,7 @@ def _resize_2d(
     else:
         raise ValueError("Unknown resize method:", method)
 
-    if extrapolation_value is not None:
+    if coordinate_transformation_mode == "tf_crop_and_resize":
         out = tvm.tir.if_then_else(
             in_y < 0,
             extrapolation_value,
@@ -674,6 +744,7 @@ def _resize_2d(
 
 def resize2d(
     data,
+    roi,
     size,
     layout="NCHW",
     method="linear",
@@ -681,6 +752,7 @@ def resize2d(
     rounding_method="",
     bicubic_alpha=-0.5,
     bicubic_exclude=0,
+    extrapolation_value=0.0,
     out_dtype=None,
     output_shape=None,
 ):
@@ -693,20 +765,37 @@ def resize2d(
         [batch, channel, in_height, in_width]
         or  [batch, in_height, in_width, channel]
 
+    roi: Tuple of Float or Expr
+        The region of interest for cropping the input image. Expected to be of
+        size 4, and format [start_h, start_w, end_h, end_w].
+        Only used if coordinate_transformation_mode is tf_crop_and_resize.
+
     size: Tuple
         Output resolution scale to
 
     layout: string, optional
         "NCHW", "NHWC", or "NCHWc".
 
-    coordinate_transformation_mode: string, optional
+    method: string, optional
+        method of interpolation ("nearest", "linear", "bicubic")
+
+    coordinate_transformation_mode : string, optional
         Describes how to transform the coordinate in the resized tensor
         to the coordinate in the original tensor.
-        Refer to the ONNX Resize operator specification for details.
-        Available options are "half_pixel", "align_corners" and "asymmetric".
+        [half_pixel, align_corners, asymmetric, pytorch_half_pixel,
+        tf_half_pixel_for_nn, and tf_crop_and_resize].
 
-    method: {"linear", "nearest_neighbor", "cubic"}
-        Method to be used for resizing.
+    rounding_method:
+        Method for rounding coordinate locations
+
+    bicubic_alpha: float, optional
+        Bicubic spline coefficient
+
+    bicubic_exclude: bool, optional:
+        Exclude values outside the image fdor bicubic interpolation
+
+    extrapolation_value: float, optional
+        Value used for extrapolation, when applicable.
 
     out_dtype: string, optional
         Type to return. If left None will be same as input type.
@@ -740,7 +829,7 @@ def resize2d(
         if output_shape is None:
             output_shape = [in_n, in_c, size[0], size[1], in_cc]
     else:
-        raise ValueError("%s layout is not supported." % layout)
+        raise ValueError(f"{layout} layout is not supported.")
 
     if isinstance(size, tuple):
         size = list(size)
@@ -753,6 +842,7 @@ def resize2d(
         return _resize_2d(
             indices,
             data,
+            roi,
             in_h,
             in_w,
             size[0],
@@ -763,6 +853,7 @@ def resize2d(
             rounding_method=rounding_method,
             alpha=bicubic_alpha,
             exclude_outside=bicubic_exclude,
+            extrapolation_value=extrapolation_value,
             out_dtype=out_dtype,
         )
 
@@ -776,7 +867,7 @@ def crop_and_resize(
     crop_size,
     layout="NCHW",
     method="bilinear",
-    extrapolation_value=0,
+    extrapolation_value=None,
     out_dtype=None,
 ):
     """Perform crop and resize operation on the data.
@@ -839,7 +930,7 @@ def crop_and_resize(
         image_h = data.shape[2].astype("int32")
         image_w = data.shape[3].astype("int32")
     else:
-        raise ValueError("%s layout is not supported." % layout)
+        raise ValueError(f"{layout} layout is not supported.")
     if method == "bilinear":
         method = "linear"
 
@@ -847,6 +938,7 @@ def crop_and_resize(
         return _resize_2d(
             indices,
             data,
+            [0.0] * 4,
             image_h,
             image_w,
             target_h,
@@ -856,6 +948,7 @@ def crop_and_resize(
             method=method,
             extrapolation_value=extrapolation_value,
             layout=layout,
+            coordinate_transformation_mode="tf_crop_and_resize",
             out_dtype=out_dtype,
         )
 
@@ -865,6 +958,7 @@ def crop_and_resize(
 def _resize_3d(
     indices,
     data,
+    roi,
     image_depth,
     image_height,
     image_width,
@@ -874,7 +968,7 @@ def _resize_3d(
     boxes=None,
     box_indices=None,
     method=None,
-    extrapolation_value=None,
+    extrapolation_value=0.0,
     layout="NCHW",
     coordinate_transformation_mode="align_corners",
     rounding_method="",
@@ -894,6 +988,11 @@ def _resize_3d(
         inputs is a 4-D tensor with shape
         [batch, channel, in_height, in_width]
         or  [batch, in_height, in_width, channel]
+
+    roi: Tuple of Float or Expr
+        The region of interest for cropping the input image. Expected to be of
+        size 6, and format [start_d, start_h, start_w, end_d, end_h, end_w].
+        Only used if coordinate_transformation_mode is tf_crop_and_resize.
 
     image_depth : integer
         Input image depth
@@ -921,17 +1020,20 @@ def _resize_3d(
         A 1-D tensor of shape [num_boxes], box_indices[i] specifies the data that
         the i-th box refers to.
 
+    method: string, optional
+        method of interpolation ("nearest", "linear", "bicubic")
+
     extrapolation_value: float, optional
         Value used for extrapolation, when applicable.
 
     layout: string, optional
         "NCHW", "NHWC", or "NCHWc".
 
-    coordinate_transformation_mode: string, optional
+    coordinate_transformation_mode : string, optional
         Describes how to transform the coordinate in the resized tensor
         to the coordinate in the original tensor.
-        Refer to the ONNX Resize operator specification for details.
-        Available options are "half_pixel", "align_corners" and "asymmetric".
+        [half_pixel, align_corners, asymmetric, pytorch_half_pixel,
+        tf_half_pixel_for_nn, and tf_crop_and_resize].
 
     rounding_method: string, optional
         indicates how to find the "nearest" pixel in nearest_neighbor method
@@ -964,9 +1066,9 @@ def _resize_3d(
     if boxes is not None:
         # TODO(mbrookhart): Find an example of this
         raise NotImplementedError("resize1d with image boxes not yet implemented")
-    in_z = get_inx(z, image_depth, target_depth, coordinate_transformation_mode)
-    in_y = get_inx(y, image_height, target_height, coordinate_transformation_mode)
-    in_x = get_inx(x, image_width, target_width, coordinate_transformation_mode)
+    in_z = get_inx(z, image_depth, target_depth, coordinate_transformation_mode, roi[2], roi[5])
+    in_y = get_inx(y, image_height, target_height, coordinate_transformation_mode, roi[1], roi[4])
+    in_x = get_inx(x, image_width, target_width, coordinate_transformation_mode, roi[0], roi[3])
 
     if method == "nearest_neighbor":
         if rounding_method == "":
@@ -1090,7 +1192,7 @@ def _resize_3d(
     else:
         raise ValueError("Unknown resize method:", method)
 
-    if extrapolation_value is not None:
+    if coordinate_transformation_mode == "tf_crop_and_resize":
         out = tvm.tir.if_then_else(
             in_z < 0,
             extrapolation_value,
@@ -1112,6 +1214,7 @@ def _resize_3d(
 
 def resize3d(
     data,
+    roi,
     size,
     layout="NCDHW",
     method="linear",
@@ -1119,6 +1222,7 @@ def resize3d(
     rounding_method="",
     bicubic_alpha=-0.5,
     bicubic_exclude=0,
+    extrapolation_value=0.0,
     out_dtype=None,
     output_shape=None,
 ):
@@ -1131,20 +1235,37 @@ def resize3d(
         [batch, channel, in_depth, in_height, in_width]
         or  [batch, in_depth, in_height, in_width, channel]
 
+    roi: Tuple of Float or Expr
+        The region of interest for cropping the input image. Expected to be of
+        size 6, and format [start_d, start_h, start_w, end_d, end_h, end_w].
+        Only used if coordinate_transformation_mode is tf_crop_and_resize.
+
     size: Tuple
         Output resolution scale to
 
     layout: string, optional
         "NCDHW", "NDHWC", or "NCDHWc".
 
-    coordinate_transformation_mode: string, optional
+    method: string, optional
+        method of interpolation ("nearest", "linear", "bicubic")
+
+    coordinate_transformation_mode : string, optional
         Describes how to transform the coordinate in the resized tensor
         to the coordinate in the original tensor.
-        Refer to the ONNX Resize operator specification for details.
-        Available options are "half_pixel", "align_corners" and "asymmetric".
+        [half_pixel, align_corners, asymmetric, pytorch_half_pixel,
+        tf_half_pixel_for_nn, and tf_crop_and_resize].
 
-    method: {"linear", "nearest_neighbor", "cubic"}
-        Method to be used for resizing.
+    rounding_method:
+        Method for rounding coordinate locations
+
+    bicubic_alpha: float, optional
+        Bicubic spline coefficient
+
+    bicubic_exclude: bool, optional:
+        Exclude values outside the image fdor bicubic interpolation
+
+    extrapolation_value: float, optional
+        Value used for extrapolation, when applicable.
 
     out_dtype: string, optional
         Type to return. If left None will be same as input type.
@@ -1185,6 +1306,7 @@ def resize3d(
         return _resize_3d(
             indices,
             data,
+            roi,
             in_d,
             in_h,
             in_w,
@@ -1197,6 +1319,7 @@ def resize3d(
             rounding_method=rounding_method,
             alpha=bicubic_alpha,
             exclude_outside=bicubic_exclude,
+            extrapolation_value=extrapolation_value,
             out_dtype=out_dtype,
         )
 

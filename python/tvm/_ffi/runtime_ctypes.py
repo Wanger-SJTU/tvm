@@ -18,7 +18,13 @@
 # pylint: disable=invalid-name
 import ctypes
 import json
+
 import numpy as np
+
+try:
+    import ml_dtypes
+except ImportError:
+    ml_dtypes = None
 from .base import _LIB, check_call
 
 tvm_shape_index_t = ctypes.c_int64
@@ -59,6 +65,8 @@ class DataTypeCode(object):
     FLOAT = 2
     HANDLE = 3
     BFLOAT = 4
+    E4M3Float = 6
+    E5M2Float = 7
 
 
 class DataType(ctypes.Structure):
@@ -71,17 +79,58 @@ class DataType(ctypes.Structure):
         DataTypeCode.FLOAT: "float",
         DataTypeCode.HANDLE: "handle",
         DataTypeCode.BFLOAT: "bfloat",
+        DataTypeCode.E4M3Float: "e4m3_float",
+        DataTypeCode.E5M2Float: "e5m2_float",
+    }
+    NUMPY2STR = {
+        np.dtype(np.bool_): "bool",
+        np.dtype(np.int8): "int8",
+        np.dtype(np.int16): "int16",
+        np.dtype(np.int32): "int32",
+        np.dtype(np.int64): "int64",
+        np.dtype(np.uint8): "uint8",
+        np.dtype(np.uint16): "uint16",
+        np.dtype(np.uint32): "uint32",
+        np.dtype(np.uint64): "uint64",
+        np.dtype(np.float16): "float16",
+        np.dtype(np.float32): "float32",
+        np.dtype(np.float64): "float64",
+        np.dtype(np.float_): "float64",
+    }
+    STR2DTYPE = {
+        "void": {"type_code": DataTypeCode.HANDLE, "bits": 0, "lanes": 0},
+        "bool": {"type_code": DataTypeCode.UINT, "bits": 1, "lanes": 1},
+        "int8": {"type_code": DataTypeCode.INT, "bits": 8, "lanes": 1},
+        "int16": {"type_code": DataTypeCode.INT, "bits": 16, "lanes": 1},
+        "int32": {"type_code": DataTypeCode.INT, "bits": 32, "lanes": 1},
+        "int64": {"type_code": DataTypeCode.INT, "bits": 64, "lanes": 1},
+        "uint8": {"type_code": DataTypeCode.UINT, "bits": 8, "lanes": 1},
+        "uint16": {"type_code": DataTypeCode.UINT, "bits": 16, "lanes": 1},
+        "uint32": {"type_code": DataTypeCode.UINT, "bits": 32, "lanes": 1},
+        "uint64": {"type_code": DataTypeCode.UINT, "bits": 64, "lanes": 1},
+        "e4m3_float8": {"type_code": DataTypeCode.E4M3Float, "bits": 8, "lanes": 1},
+        "e5m2_float8": {"type_code": DataTypeCode.E5M2Float, "bits": 8, "lanes": 1},
+        "float16": {"type_code": DataTypeCode.FLOAT, "bits": 16, "lanes": 1},
+        "float32": {"type_code": DataTypeCode.FLOAT, "bits": 32, "lanes": 1},
+        "float64": {"type_code": DataTypeCode.FLOAT, "bits": 64, "lanes": 1},
     }
 
     def __init__(self, type_str):
         super(DataType, self).__init__()
-        if isinstance(type_str, np.dtype):
+        numpy_str_map = DataType.NUMPY2STR
+        if type_str in numpy_str_map:
+            type_str = numpy_str_map[type_str]
+        elif isinstance(type_str, np.dtype):
             type_str = str(type_str)
 
-        if type_str == "bool":
-            self.bits = 1
-            self.type_code = DataTypeCode.UINT
-            self.lanes = 1
+        assert isinstance(type_str, str)
+
+        str_dtype_map = DataType.STR2DTYPE
+        if type_str in str_dtype_map:
+            dtype_map = str_dtype_map[type_str]
+            self.bits = dtype_map["bits"]
+            self.type_code = dtype_map["type_code"]
+            self.lanes = dtype_map["lanes"]
             return
 
         arr = type_str.split("x")
@@ -105,6 +154,12 @@ class DataType(ctypes.Structure):
         elif head.startswith("bfloat"):
             self.type_code = DataTypeCode.BFLOAT
             head = head[6:]
+        elif head.startswith("e4m3_float"):
+            self.type_code = DataTypeCode.E4M3Float
+            head = head[10:]
+        elif head.startswith("e5m2_float"):
+            self.type_code = DataTypeCode.E5M2Float
+            head = head[10:]
         elif head.startswith("custom"):
             # pylint: disable=import-outside-toplevel
             import tvm.runtime._ffi_api
@@ -122,6 +177,8 @@ class DataType(ctypes.Structure):
 
     def __repr__(self):
         # pylint: disable=import-outside-toplevel
+        if self.bits == 0 and self.lanes == 0:
+            return "void"
         if self.bits == 1 and self.lanes == 1:
             return "bool"
         if self.type_code in DataType.CODE2STR:
@@ -146,6 +203,11 @@ class DataType(ctypes.Structure):
         return not self.__eq__(other)
 
 
+if ml_dtypes is not None:
+    DataType.NUMPY2STR[np.dtype(ml_dtypes.bfloat16)] = "bfloat16"
+    DataType.NUMPY2STR[np.dtype(ml_dtypes.float8_e4m3fn)] = "e4m3_float8"
+    DataType.NUMPY2STR[np.dtype(ml_dtypes.float8_e5m2)] = "e5m2_float8"
+
 RPC_SESS_MASK = 128
 
 
@@ -159,42 +221,73 @@ class Device(ctypes.Structure):
     OpenCL.  Some properties may return None depending on whether an
     API exposes that particular property.
 
+    NOTE!  The integer values in MASK2STR and STR2MASK *must* correspond
+    to the values provided by the DLDeviceType and TVMDeviceExtType enums.
     """
+
+    kDLCPU = 1
+    kDLCUDA = 2
+    kDLCUDAHost = 3
+    kDLOpenCL = 4
+    kDLVulkan = 7
+    kDLMetal = 8
+    kDLVPI = 9
+    kDLROCM = 10
+    kDLROCMHost = 11
+    kDLExtDev = 12
+    kDLCUDAManaged = 13
+    kDLOneAPI = 14
+    kDLWebGPU = 15
+    kDLHexagon = 16
+    kDLAOCL = 32
+    kDLSDAccel = 33
+    kOpenGL = 34
+    kDLMicroDev = 35
 
     _fields_ = [("device_type", ctypes.c_int), ("device_id", ctypes.c_int)]
     MASK2STR = {
-        1: "cpu",
-        2: "cuda",
-        4: "opencl",
-        5: "aocl",
-        6: "sdaccel",
-        7: "vulkan",
-        8: "metal",
-        9: "vpi",
-        10: "rocm",
-        12: "ext_dev",
-        14: "hexagon",
-        15: "webgpu",
+        kDLCPU: "cpu",
+        kDLCUDA: "cuda",
+        kDLCUDAHost: "cuda_host",
+        kDLCUDAManaged: "cuda_managed",
+        kDLOpenCL: "opencl",
+        kDLVulkan: "vulkan",
+        kDLMetal: "metal",
+        kDLVPI: "vpi",
+        kDLROCM: "rocm",
+        kDLROCMHost: "rocm_host",
+        kDLExtDev: "ext_dev",
+        kDLOneAPI: "oneapi",
+        kDLWebGPU: "webgpu",
+        kDLHexagon: "hexagon",
+        kDLAOCL: "aocl",
+        kDLSDAccel: "sdaccel",
+        kOpenGL: "opengl",
+        kDLMicroDev: "microdev",
     }
+
     STR2MASK = {
-        "llvm": 1,
-        "stackvm": 1,
-        "cpu": 1,
-        "c": 1,
-        "cuda": 2,
-        "nvptx": 2,
-        "cl": 4,
-        "opencl": 4,
-        "aocl": 5,
-        "aocl_sw_emu": 5,
-        "sdaccel": 6,
-        "vulkan": 7,
-        "metal": 8,
-        "vpi": 9,
-        "rocm": 10,
-        "ext_dev": 12,
-        "hexagon": 14,
-        "webgpu": 15,
+        "llvm": kDLCPU,
+        "stackvm": kDLCPU,
+        "cpu": kDLCPU,
+        "c": kDLCPU,
+        "test": kDLCPU,
+        "hybrid": kDLCPU,
+        "composite": kDLCPU,
+        "cuda": kDLCUDA,
+        "nvptx": kDLCUDA,
+        "cl": kDLOpenCL,
+        "opencl": kDLOpenCL,
+        "sdaccel": kDLOpenCL,
+        "aocl": kDLAOCL,
+        "aocl_sw_emu": kDLAOCL,
+        "vulkan": kDLVulkan,
+        "metal": kDLMetal,
+        "vpi": kDLVPI,
+        "rocm": kDLROCM,
+        "ext_dev": kDLExtDev,
+        "hexagon": kDLHexagon,
+        "webgpu": kDLWebGPU,
     }
 
     def __init__(self, device_type, device_id):
@@ -245,7 +338,7 @@ class Device(ctypes.Structure):
     def warp_size(self):
         """Number of threads that execute concurrently.
 
-        Returns device value for for cuda, rocm, and vulkan.  Returns
+        Returns device value for cuda, rocm, and vulkan.  Returns
         1 for metal and opencl devices, regardless of the physical
         device.  Returns remote device value for RPC devices.  Returns
         None for all other devices.
@@ -395,6 +488,17 @@ class Device(ctypes.Structure):
         """
         return self._GetDeviceAttr(self.device_type, self.device_id, 12)
 
+    def texture_spatial_limit(self):
+        """Returns limits for textures by spatial dimensions
+
+        Returns
+        -------
+        limit : int or None
+            Maximum size of the texture by spatial dimensions
+
+        """
+        return self._GetDeviceAttr(self.device_type, self.device_id, 12)
+
     def create_raw_stream(self):
         """Create a new runtime stream at the context.
 
@@ -472,6 +576,19 @@ class TVMArray(ctypes.Structure):
         ("strides", ctypes.POINTER(tvm_shape_index_t)),
         ("byte_offset", ctypes.c_uint64),
     ]
+
+    def __str__(self):
+        shape = [self.shape[i] for i in range(self.ndim)]
+        if self.strides:
+            strides = [self.strides[i] for i in range(self.ndim)]
+        else:
+            strides = []
+
+        return (
+            f"TVMArray(data=0x{self.data:016x}, device={self.device}, "
+            f"dtype={self.dtype}, shape={shape}, "
+            f"strides={strides}, byte_offset={self.byte_offset})"
+        )
 
 
 class ObjectRValueRef:

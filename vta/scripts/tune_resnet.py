@@ -183,8 +183,30 @@ def tune_tasks(
         prefix = "[Task %2d/%2d] " % (i + 1, len(tasks))
 
         # create tuner
-        if tuner == "xgb" or tuner == "xgb-rank":
+        if tuner == "xgb":
+            tuner_obj = XGBTuner(tsk, loss_type="reg")
+        elif tuner == "xgb_knob":
+            tuner_obj = XGBTuner(tsk, loss_type="reg", feature_type="knob")
+        elif tuner == "xgb_itervar":
+            tuner_obj = XGBTuner(tsk, loss_type="reg", feature_type="itervar")
+        elif tuner == "xgb_curve":
+            tuner_obj = XGBTuner(tsk, loss_type="reg", feature_type="curve")
+        elif tuner == "xgb_rank":
             tuner_obj = XGBTuner(tsk, loss_type="rank")
+        elif tuner == "xgb_rank_knob":
+            tuner_obj = XGBTuner(tsk, loss_type="rank", feature_type="knob")
+        elif tuner == "xgb_rank_itervar":
+            tuner_obj = XGBTuner(tsk, loss_type="rank", feature_type="itervar")
+        elif tuner == "xgb_rank_curve":
+            tuner_obj = XGBTuner(tsk, loss_type="rank", feature_type="curve")
+        elif tuner == "xgb_rank_binary":
+            tuner_obj = XGBTuner(tsk, loss_type="rank-binary")
+        elif tuner == "xgb_rank_binary_knob":
+            tuner_obj = XGBTuner(tsk, loss_type="rank-binary", feature_type="knob")
+        elif tuner == "xgb_rank_binary_itervar":
+            tuner_obj = XGBTuner(tsk, loss_type="rank-binary", feature_type="itervar")
+        elif tuner == "xgb_rank_binary_curve":
+            tuner_obj = XGBTuner(tsk, loss_type="rank-binary", feature_type="curve")
         elif tuner == "ga":
             tuner_obj = GATuner(tsk, pop_size=50)
         elif tuner == "random":
@@ -274,8 +296,7 @@ if __name__ == "__main__":
         func=relay_prog,
         params=params,
         ops=(relay.op.get("nn.conv2d"),),
-        target=target,
-        target_host=env.target_host,
+        target=tvm.target.Target(target, host=env.target_host),
     )
 
     # Perform Autotuning
@@ -309,12 +330,16 @@ if __name__ == "__main__":
         if target.device_name != "vta":
             with tvm.transform.PassContext(opt_level=3, disabled_pass={"AlterOpLayout"}):
                 graph, lib, params = relay.build(
-                    relay_prog, target=target, params=params, target_host=env.target_host
+                    relay_prog,
+                    target=tvm.target.Target(target, host=env.target_host),
+                    params=params,
                 )
         else:
             with vta.build_config(opt_level=3, disabled_pass={"AlterOpLayout"}):
                 graph, lib, params = relay.build(
-                    relay_prog, target=target, params=params, target_host=env.target_host
+                    relay_prog,
+                    target=tvm.target.Target(target, host=env.target_host),
+                    params=params,
                 )
 
         # Export library

@@ -16,8 +16,8 @@
     under the License.
 
 
-What do to when encountering TVM Errors
-=======================================
+Handle TVM Errors
+=================
 
 When running TVM, you may encounter an error message like:
 
@@ -69,4 +69,3 @@ pieces of information:
 
 Without these details it is very difficult for the TVM developers to do very
 much to help you.
-

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,36 +16,28 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -e
-set -u
+set -euxo pipefail
 
-# Python is required by apps/bundle_deploy
-source tests/scripts/setup-pytest-env.sh
+if [ $# -gt 0 ]; then
+    BUILD_DIR="$1"
+elif [ -n "${TVM_BUILD_PATH:-}" ]; then
+    # TVM_BUILD_PATH may contain multiple space-separated paths.  If
+    # so, use the first one.
+    BUILD_DIR=$(IFS=" "; set -- $TVM_BUILD_PATH; echo $1)
+else
+    BUILD_DIR=build
+fi
 
-export LD_LIBRARY_PATH="lib:${LD_LIBRARY_PATH:-}"
+
 # NOTE: important to use abspath, when VTA is enabled.
-export VTA_HW_PATH=`pwd`/3rdparty/vta-hw
+VTA_HW_PATH=$(pwd)/3rdparty/vta-hw
+export VTA_HW_PATH
 
 # to avoid CI thread throttling.
 export TVM_BIND_THREADS=0
 export OMP_NUM_THREADS=1
 
-# Remove existing testcases
-rm -f build/*_test
-
-make cpptest -j2
-
-# "make crttest" requires USE_MICRO to be enabled, which is not always the case.
-if grep crttest build/Makefile > /dev/null; then
-    make crttest  # NOTE: don't parallelize, due to issue with build deps.
-fi
-
-for test in build/*_test; do
-    ./$test
-done
-
-# Test MISRA-C runtime
-cd apps/bundle_deploy
-rm -rf build
-make test_dynamic test_static
-cd ../..
+pushd "${BUILD_DIR}"
+# run cpp test executable
+./cpptest
+popd

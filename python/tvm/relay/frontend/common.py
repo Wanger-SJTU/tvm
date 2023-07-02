@@ -24,14 +24,29 @@ import tvm
 from tvm.ir import IRModule
 from tvm.topi.utils import get_const_tuple
 
+from ..expr_functor import ExprMutator
 from .. import expr as _expr
 from .. import function as _function
 from .. import transform as _transform
 from .. import op as _op
+from .. import ty as _ty
 from .. import analysis
 
+
+class DuplicateFilter:
+    """A log filter that only prints the same message once."""
+
+    def __init__(self):
+        self.msgs = set()
+
+    def filter(self, record):
+        self.msgs.add(record.msg)
+        return record.msg not in self.msgs
+
+
 # pylint: disable=invalid-name
-logger = logging.getLogger("Common")
+logger = logging.getLogger("Frontend")
+logger.addFilter(DuplicateFilter())
 # Uncomment below line to print all debug msgs
 # logger.setLevel(logging.DEBUG)
 
@@ -84,7 +99,7 @@ class StrAttrsDict(object):
         if key in self.attrs:
             return float(self.attrs[key])
         if isinstance(default, RequiredAttr):
-            raise AttributeError("Required attribute {} not found.".format(key))
+            raise AttributeError(f"Required attribute {key} not found.")
         return default
 
     def get_int(self, key, default=RequiredAttr()):
@@ -108,7 +123,7 @@ class StrAttrsDict(object):
                 return None
             return int(val)
         if isinstance(default, RequiredAttr):
-            raise AttributeError("Required attribute {} not found.".format(key))
+            raise AttributeError(f"Required attribute {key} not found.")
         return default
 
     def get_str(self, key, default=RequiredAttr()):
@@ -129,7 +144,7 @@ class StrAttrsDict(object):
         if key in self.attrs:
             return self.attrs[key]
         if isinstance(default, RequiredAttr):
-            raise AttributeError("Required attribute {} not found.".format(key))
+            raise AttributeError(f"Required attribute {key} not found.")
         return default
 
     def get_int_tuple(self, key, default=RequiredAttr()):
@@ -155,7 +170,7 @@ class StrAttrsDict(object):
                 if x
             )
         if isinstance(default, RequiredAttr):
-            raise AttributeError("Required attribute {} not found.".format(key))
+            raise AttributeError(f"Required attribute {key} not found.")
         return default
 
     def get_float_tuple(self, key, default=RequiredAttr()):
@@ -178,7 +193,7 @@ class StrAttrsDict(object):
             tshape = self.attrs[key]
             return tuple(float(x.strip()) for x in tshape.strip("()[]").split(","))
         if isinstance(default, RequiredAttr):
-            raise AttributeError("Required attribute {} not found.".format(key))
+            raise AttributeError(f"Required attribute {key} not found.")
         return default
 
     def get_tuple_tuple_int(self, key, default=RequiredAttr()):
@@ -207,7 +222,7 @@ class StrAttrsDict(object):
             return tuple(seq)
 
         if isinstance(default, RequiredAttr):
-            raise AttributeError("Required attribute {} not found.".format(key))
+            raise AttributeError(f"Required attribute {key} not found.")
         return default
 
     def get_int_list(self, key, default=RequiredAttr()):
@@ -229,7 +244,7 @@ class StrAttrsDict(object):
             tshape = self.attrs[key]
             return tuple(int(x.strip()) for x in tshape.strip("[]()").split(","))
         if isinstance(default, RequiredAttr):
-            raise AttributeError("Required attribute {} not found.".format(key))
+            raise AttributeError(f"Required attribute {key} not found.")
         return default
 
     def get_bool(self, key, default=RequiredAttr()):
@@ -251,7 +266,7 @@ class StrAttrsDict(object):
             val = self.attrs[key]
             return val.strip().lower() in ["true", "1", "t", "y", "yes"]
         if isinstance(default, RequiredAttr):
-            raise AttributeError("Required attribute {} not found.".format(key))
+            raise AttributeError(f"Required attribute {key} not found.")
         return default
 
 
@@ -277,7 +292,7 @@ def get_relay_op(op_name):
             if op is not None:
                 break
     if not op:
-        raise tvm.error.OpNotImplemented("Unable to map op_name {} to relay".format(op_name))
+        raise tvm.error.OpNotImplemented(f"Unable to map op_name {op_name} to relay")
     return op
 
 
@@ -290,13 +305,16 @@ class ExprTable(object):
         self.const_ctr = 1
         self.in_padding = False
 
-    def new_const(self, value, shape=None, dtype="float32"):
-        name = "_param_%d" % (self.const_ctr)
+    def new_const(self, value, shape=None, dtype="float32", source_name=None):
+        """Construct a new var expr and add to exprs dictionary"""
+        name = f"_param_{self.const_ctr}"
         if hasattr(value, "shape"):
             shape = value.shape
         self.const_ctr += 1
         self.params[name] = value
         self.exprs[name] = _expr.var(name_hint=name, shape=shape, dtype=dtype)
+        if source_name:
+            self.exprs[name] = set_span(self.exprs[name], source_name)
         return self.exprs[name]
 
     def get_expr(self, name):
@@ -394,7 +412,7 @@ class AttrCvt(object):
         if self._custom_check:
             func, msg = self._custom_check
             if not func(attrs):
-                raise RuntimeError("Check failed: {}".format(msg))
+                raise RuntimeError(f"Check failed: {msg}")
         # get new op_name
         if isinstance(self._op_name, str):
             op_name = self._op_name
@@ -447,7 +465,7 @@ class AttrCvt(object):
         else:
             k = None  # should raise
         if not isinstance(k, str):
-            msg = "{} is not a valid target, (name, default) expected.".format(target)
+            msg = f"{target} is not a valid target, (name, default) expected."
             raise ValueError(msg)
         return k, v, t
 
@@ -461,7 +479,7 @@ class AttrCvt(object):
         """Wrapper for getting required attributes."""
         assert isinstance(attr, dict)
         if key not in attr:
-            raise AttributeError("Required attribute {} not found.".format(key))
+            raise AttributeError(f"Required attribute {key} not found.")
         return attr[key]
 
 
@@ -545,11 +563,12 @@ def infer_value(input_val, params, mod=None):
             mod["main"] = _function.Function(analysis.free_vars(input_val), input_val)
         else:
             mod = IRModule.from_expr(input_val)
-        exc = tvm.relay.create_executor("debug", mod=mod, device=tvm.cpu(), target="llvm")
         inputs = []
         for param in mod["main"].params:
             inputs.append(params[param.name_hint])
-        result = exc.evaluate()(*inputs)
+        result = tvm.relay.create_executor(
+            "debug", mod=mod, device=tvm.cpu(), target="llvm"
+        ).evaluate()(*inputs)
         return result
 
 
@@ -576,14 +595,15 @@ def infer_value_simulated(input_val, params):
     return output_value
 
 
-def try_infer_value(val, on_success=None, on_failure=None):
+def try_infer_value(val, on_success=None, on_failure=None, parameters=None):
     """Try running infer_value on the input val, and if successful, return the inferred value or
     pass it to on_success callback if provided. Otherwise, run on_failure callback if it is
     provided, or return the input val as output. In each case, the second return value
     indicates whether infer_value has succeeded or not.
     """
     try:
-        ret = infer_value(val, {}).numpy()
+        params = parameters if parameters is not None else {}
+        ret = infer_value(val, params).numpy()
         if on_success:
             return on_success(ret), True
         return ret, True
@@ -591,6 +611,19 @@ def try_infer_value(val, on_success=None, on_failure=None):
         if on_failure:
             return on_failure(), False
         return val, False
+
+
+def shape_of(x, dtype="int64", start=None, end=None):
+    """Get shape of a tensor."""
+
+    ttype = infer_type(x).checked_type
+    if not _ty.is_dynamic(ttype):
+        shape = list(ttype.shape)
+        start = start or 0  # default to first
+        end = end or len(shape)  # default to last
+        shape_sliced = shape[start:end]
+        return _expr.const(shape_sliced, dtype)
+    return _op.shape_of(x, dtype)
 
 
 def new_var(name_hint, type_annotation=None, shape=None, dtype="float32"):
@@ -624,3 +657,561 @@ def to_int_list(np_array):
     cause problems in relay/TOPI.
     """
     return [int(x) for x in np_array]
+
+
+def unbind(data, axis=0):
+    """
+    Unbind was taken from Pytorch frontend. The operation removes a tensor dimension
+    and returns a tuple of all slices along a given dimension, with specified axis removed.
+    TODO (vvchernov): It needs such operation on relay side to reduce time consumption
+    on squeeze operation.
+
+    Parameters
+    ----------
+    data : relay.Expr
+        Input tensor
+    axis : int
+        Axis along which tensor is split.
+    Returns
+    -------
+    result : List[relay.Expr]
+        The sequence of computed tensors
+    """
+    shape = infer_shape(data)
+    if axis >= len(shape):
+        msg = "Please check input dim, it shouldn't be greater than or equal to rank."
+        raise AttributeError(msg)
+
+    selections = shape[axis]
+    res_split = _op.split(data, selections, axis)
+    ret = []
+    for i in range(selections):
+        ret.append(_op.squeeze(res_split[i], axis=[axis]))
+    return _expr.TupleWrapper(_expr.Tuple(ret), selections)
+
+
+def rnn_cell(
+    input_seqs, hidden_state, w_inp, w_hid, b_inp=None, b_hid=None, backwards=False, act=_op.tanh
+):
+    """
+    Common implementation of RNN cell for all frontends of TVM
+
+    Parameters
+    ----------
+    input_seqs : List[relay.Expr]
+        The sequence of input tensors
+        Input tensor should be 2d while issue #8412 is not resolved
+        Shape = (batch, feature_size)
+    hidden_state : relay.Expr
+        Hidden state. shape = (batch_size, hidden_size)
+    w_inp, w_hid: relay.Expr
+        weight matrices. shape = (hidden_size, feature_size), (hidden_size, feature_size)
+    b_inp, b_hid : relay.Expr
+        bias matrices. The same order of internal parts as for weights. shape = (1 * hidden_size)
+    backwards : bool
+        Flag for reverse pass of RNN
+    act : relay.op
+        activation function. It is tanh by default.
+
+    Returns
+    -------
+    result : List[relay.Expr], relay.Expr, relay.Expr
+        The sequence of computed result, final hidden and cell state
+    """
+    outputs_list = []
+    for x_t in input_seqs if not backwards else reversed(input_seqs):
+        xwt = _op.nn.dense(x_t, w_inp)
+        hwt = _op.nn.dense(hidden_state, w_hid)
+        if b_inp is not None and b_hid is not None:
+            xwt += b_inp
+            hwt += b_hid
+        hidden_state = act(xwt + hwt)
+        outputs_list.append(hidden_state)  # [seq_num, (batch, hidden_size)]
+    return outputs_list, hidden_state
+
+
+def gru_cell(
+    input_seqs,
+    hidden_state,
+    w_inp,
+    w_hid,
+    b_inp=None,
+    b_hid=None,
+    rz_act=_op.sigmoid,
+    n_act=_op.tanh,
+    backwards=False,
+    linear_before_reset=True,
+    sequence_lens=None,
+):
+    """
+    Common implementation of GRU cell for all frontends of TVM
+    TODO(vvchernov): currently it is used by pytorch and ONNX. Extend for other frontends
+
+    Parameters
+    ----------
+    input_seqs : List[relay.Expr]
+        The sequence of input tensors
+        Input tensor should be 2d while issue #8412 is not resolved
+        Shape = (batch, feature_size)
+    hidden_state : relay.Expr
+        Hidden state. shape = (batch_size, hidden_size)
+    w_inp, w_hid : relay.Expr
+        weight matrices. wi shape = (3 * hidden_size, feature_size)
+        wh shape = (3 * hidden_size, hidden_size)
+        NOTE: wi = (w_ir|w_iz|w_in) for reset, update and new gates.
+        The order is important for correct GRU calculation!
+    b_inp, b_hid : relay.Expr
+        bias matrices. The same order of internal parts as for weights. shape = (3 * hidden_size)
+    r_act : relay.op
+        activation function for reset gate. it is sigmoid by default
+    z_act : relay.op
+        activation function for update gate. it is sigmoid by default
+    n_act : relay.op
+        activation function for new gate. it is tanh by default
+    backwards : bool
+        Flag for reverse pass of GRU
+    linear_before_reset : bool
+        Flag for applying the linear transformation before multiplying by the output of the reset
+        gate.
+    sequence_lens : relay.op
+        Tensor specifying lengths of the sequences in a batch.
+        Shape = (batch_size)
+    Returns
+    -------
+    result : List[relay.Expr], relay.Expr, relay.Expr
+        The sequence of computed result, final hidden and cell state
+    """
+
+    outputs_list = []
+
+    seq_len = len(input_seqs)
+    input_dtype = infer_type(input_seqs[0]).checked_type.dtype
+
+    if sequence_lens is not None:
+        shape = infer_shape(sequence_lens)
+        dtype = infer_type(sequence_lens).checked_type.dtype
+
+        arange = _op.arange(_op.const(0), _op.const(seq_len), dtype=dtype)
+        arange = _op.expand_dims(arange, 1)
+        sequence_lens = _op.broadcast_to(sequence_lens, [seq_len, shape[0]])
+
+        # cast to data dtype
+        mask = _op.less(arange, sequence_lens)
+        mask = _op.cast(mask, dtype=input_dtype)
+        mask = _op.expand_dims(mask, 2)
+        mask_seqs = unbind(mask)
+
+        res_mask = _op.greater_equal(arange, sequence_lens)
+        res_mask = _op.cast(res_mask, dtype=input_dtype)
+        res_mask = _op.expand_dims(res_mask, 2)
+        res_mask_seqs = unbind(res_mask)
+
+        if backwards:
+            # need a mask to keep intial_h_B correct
+            initial_h = hidden_state
+            initial_h_mask = _op.equal(arange, sequence_lens)
+            initial_h_mask = _op.cast(initial_h_mask, dtype=input_dtype)
+            initial_h_mask = _op.expand_dims(initial_h_mask, 2)
+            initial_h_mask_seqs = unbind(initial_h_mask)
+
+    output = _op.zeros(infer_shape(hidden_state), input_dtype)
+    for i in range(seq_len) if not backwards else reversed(range(seq_len)):
+        x_t = input_seqs[i]
+        xwt = _op.nn.dense(x_t, w_inp)
+        if linear_before_reset:
+            hwt = _op.nn.dense(hidden_state, w_hid)
+            if b_inp is not None and b_hid is not None:
+                xwt += b_inp
+                hwt += b_hid
+            i_r, i_z, i_n = _op.split(xwt, 3, axis=-1)
+            h_r, h_z, h_n = _op.split(hwt, 3, axis=-1)
+            r_gate = rz_act(i_r + h_r)
+            z_gate = rz_act(i_z + h_z)
+            n_gate = n_act(i_n + r_gate * h_n)
+        else:
+            i_r, i_z, i_n = _op.split(xwt, 3, axis=1)
+            w_hr, w_hz, w_hn = _op.split(w_hid, 3, axis=0)
+            r_gate = i_r + _op.nn.dense(hidden_state, w_hr)
+            z_gate = i_z + _op.nn.dense(hidden_state, w_hz)
+            if b_inp is not None and b_hid is not None:
+                b_ir, b_iz, b_in = _op.split(b_inp, 3, axis=-1)
+                b_hr, b_hz, b_hn = _op.split(b_hid, 3, axis=-1)
+                r_gate += b_ir + b_hr
+                r_gate = rz_act(r_gate)
+                z_gate += b_iz + b_hz
+                i_n += b_in
+                h_n = _op.nn.dense((r_gate * hidden_state), w_hn) + b_hn
+            else:
+                r_gate = rz_act(r_gate)
+                h_n = _op.nn.dense((r_gate * hidden_state), w_hn)
+            z_gate = rz_act(z_gate)
+            n_gate = n_act(i_n + h_n)
+
+        hidden_state = (hidden_state - n_gate) * z_gate + n_gate
+
+        if sequence_lens is not None:
+            hidden_state = hidden_state * mask_seqs[i]
+
+        outputs_list.append(hidden_state)  # [seq_num, (batch, hidden_size)]
+
+        if sequence_lens is not None:
+            output = output * res_mask_seqs[i] + hidden_state
+        else:
+            output = hidden_state
+
+        # make sure initial_h_B correct
+        if backwards and sequence_lens is not None:
+            hidden_state = hidden_state + initial_h * initial_h_mask_seqs[i]
+
+    return outputs_list, output
+
+
+def lstm_cell(
+    input_seqs,
+    hidden_state,
+    cell_state,
+    w_inp,
+    w_hid,
+    b_inp=None,
+    b_hid=None,
+    proj=None,
+    p_i=None,
+    p_f=None,
+    p_o=None,
+    f_act=_op.sigmoid,
+    g_act=_op.tanh,
+    h_act=_op.tanh,
+    backwards=False,
+):
+    """
+    Common implementation of LSTM cell for all frontends of TVM
+    TODO (vvchernov): currently it is used by onnx and pytorch. Extend for other frontends
+
+    Parameters
+    ----------
+    input_seqs : List[relay.Expr]
+        The sequence of input tensors
+        Input tensor should be 2d while issue #8412 is not resolved
+        Shape = (batch, feature_size)
+    hidden_state : relay.Expr
+        Hidden state. shape = (batch, hidden_size)
+    cell_state : relay.Expr
+        Cell state. shape = (batch, hidden_size)
+    w_inp, w_hid : relay.Expr
+        weight matrices. wi shape = (4 * hidden_size, feature_size)
+        wh shape = (4 * hidden_size, hidden_size or proj_size)
+        NOTE: wi = (w_ii|w_if|w_ig|w_io) for input, forget, cell and output gates.
+        The order is important for correct LSTM calculation!
+    b_inp, b_hid : relay.Expr
+        bias matrices. The same order of internal parts as for weights. shape = (4 * hidden_size)
+    proj : relay.Expr
+        projection matrix. shape = (proj_size, hidden_size)
+    p_i, p_f, p_o : relay.Expr
+        peephole LSTM matrices. shape = (batch, hidden_size)
+    f_act, g_act, h_act : relay.op
+        activation functions
+    backwards : bool
+        Flag for reverse pass of LSTM
+
+    Returns
+    -------
+    result : List[relay.Expr], relay.Expr, relay.Expr
+        The sequence of computed result, final hidden and cell state
+    """
+
+    outputs_list = []
+    for x_t in input_seqs if not backwards else reversed(input_seqs):
+        # x_t shape = (batch, feature size), step shape = (batch, feature size + hidden_size)
+        step = _op.concatenate([x_t, hidden_state], axis=1)
+        cat_w = _op.concatenate([w_inp, w_hid], axis=1)
+        # Instead of nn.dense(x_t, w_inp) + nn.dense(hidden_state, w_hid)
+        # nn.dense(step, cat_w) is used
+        # gates shape = (batch, 4 * hidden_size)
+        gates = _op.nn.dense(step, cat_w)
+        # Add biases
+        if b_inp is not None:
+            gates += b_inp
+        if b_hid is not None:
+            gates += b_hid
+        # any gate shape = (batch, hidden_size)
+        inp_gate, fgt_gate, cell_gate, otp_gate = _op.split(gates, 4, axis=-1)
+
+        if p_i is not None and p_f is not None:
+            inp_gate = f_act(inp_gate + p_i * cell_state)
+            fgt_gate = f_act(fgt_gate + p_f * cell_state)
+        else:
+            inp_gate = f_act(inp_gate)
+            fgt_gate = f_act(fgt_gate)
+
+        cell_gate = g_act(cell_gate)
+        cell_state = fgt_gate * cell_state + inp_gate * cell_gate
+        if p_o is not None:
+            otp_gate = f_act(otp_gate + p_o * cell_state)
+        else:
+            otp_gate = f_act(otp_gate)
+
+        hidden_state = otp_gate * h_act(cell_state)
+
+        if proj is not None:
+            hidden_state = _op.nn.dense(hidden_state, proj)
+
+        outputs_list.append(hidden_state)  # [seq_num, (batch, hidden_size)]
+
+    return outputs_list, hidden_state, cell_state
+
+
+def autopad(
+    data,
+    strides,
+    kernel_shape,
+    dilations=(1, 1),
+    pad_type="constant",
+    deconv=False,
+    mode="SAME_UPPER",
+    pad_value=0.0,
+):
+    """
+    Perform autopadding with dynamic input shapes
+    """
+    # get attributes as constants
+    strides = _op.const(np.array(strides), dtype="int64")
+    dilated_kernel_shape = _op.const(
+        np.array(
+            [(kernel - 1) * dilation + 1 for kernel, dilation in zip(kernel_shape, dilations)]
+        ),
+        dtype="int64",
+    )
+    # get input shape
+    ndim = len(infer_shape(data))
+    shape = _op.strided_slice(shape_of(data, dtype="int64"), [2], [ndim])
+
+    # set up integer constants
+    zero = _op.const(0, dtype="int64")
+    one = _op.const(1, dtype="int64")
+    two = _op.const(2, dtype="int64")
+
+    # Calculate total padding
+    mod = _op.mod(shape, strides)
+
+    left = _op.maximum(dilated_kernel_shape - strides, zero)
+    right = _op.maximum(dilated_kernel_shape - mod, zero)
+
+    total_pad = _op.where(_op.equal(mod, zero), left, right)
+    if deconv:
+        total_pad = _op.const(np.array(kernel_shape), dtype="int64") - one - total_pad
+
+    # split total padding into before and after
+    pad_before = _op.floor_divide(total_pad, two)
+    pad_after = total_pad - pad_before
+
+    # combine
+    if "LOWER" in mode:
+        pad = _op.concatenate(
+            [_op.reshape(pad_after, [-1, 1]), _op.reshape(pad_before, [-1, 1])], axis=1
+        )
+    else:
+        pad = _op.concatenate(
+            [_op.reshape(pad_before, [-1, 1]), _op.reshape(pad_after, [-1, 1])], axis=1
+        )
+
+    # pad N and C with zeros
+    pad = _op.concatenate([_op.const(np.zeros([2, 2], dtype="int64"), dtype="int64"), pad], axis=0)
+
+    if isinstance(pad_value, (float, int)):
+        pad_value = _op.const(pad_value)
+
+    return _op.nn.pad(data, fold_constant(pad), pad_value, pad_type)
+
+
+def ensure_scalar_shape(x):
+    """
+    Assume that `x` is a tensor with one element (regardless of tensor rank).
+    Return a version of that tensor with rank 0.
+    """
+    x_shape = infer_shape(x)
+    x_rank = len(x_shape)
+
+    if x_rank == 0:
+        return x
+
+    num_elem = np.prod(x_shape)
+    assert num_elem == 1, f"Cannot squeeze tensor shape {x_shape} to scalar form."
+
+    return _op.squeeze(x)
+
+
+def try_resolve_var_to_const(x, graph_params):
+    """
+    Try to resolve the value of tensor `x` to a specific value.
+    If successful, return a Const op with that value.
+    If unsuccessful, simply return `x`.
+    """
+    if isinstance(x, _expr.Var) and x.name_hint in graph_params:
+        value = graph_params[x.name_hint].numpy()
+        dtype = infer_type(x).checked_type.dtype
+        return _op.const(value, dtype)
+
+    return x
+
+
+class _SpanFiller(ExprMutator):
+    """SpanFiller"""
+
+    def __init__(self, span):
+        ExprMutator.__init__(self)
+        if isinstance(span, tvm.relay.Span):
+            self._span = span
+        elif isinstance(span, str):
+            self._span = tvm.relay.Span(tvm.relay.SourceName(span), 0, 0, 0, 0)
+        elif isinstance(span, bytes):
+            self._span = tvm.relay.Span(tvm.relay.SourceName(span.decode("utf-8")), 0, 0, 0, 0)
+        else:
+            assert False, f"unsupported span type: {type(span)}"
+
+    def visit(self, expr):
+        if hasattr(expr, "span") and expr.span:
+            return expr
+
+        return super().visit(expr)
+
+    def visit_function(self, fn):
+        new_params = [self.visit(x) for x in fn.params]
+        new_body = self.visit(fn.body)
+        return _function.FunctionWithFields(
+            fn, list(new_params), new_body, fn.ret_type, fn.type_params, fn.attrs, None, self._span
+        )
+
+    def visit_let(self, let):
+        new_variable = self.visit(let.var)
+        new_value = self.visit(let.value)
+        new_body = self.visit(let.body)
+        return _expr.LetWithFields(let, new_variable, new_value, new_body, None, self._span)
+
+    def visit_call(self, call):
+        new_args = [self.visit(arg) for arg in call.args]
+        # call.op might be RelayExpr or Op type
+        # ExprMutator will return directly if subject belongs to Op type
+        new_op = self.visit(call.op)
+        return _expr.CallWithFields(
+            call, new_op, new_args, call.attrs, call.type_args, None, self._span
+        )
+
+    def visit_var(self, var):
+        return _expr.VarWithFields(var, var.vid, var.type_annotation, None, self._span)
+
+    def visit_if(self, ite):
+        return _expr.IfWithFields(
+            ite,
+            self.visit(ite.cond),
+            self.visit(ite.true_branch),
+            self.visit(ite.false_branch),
+            None,
+            self._span,
+        )
+
+    def visit_tuple(self, tup):
+        return _expr.TupleWithFields(
+            tup, [self.visit(field) for field in tup.fields], None, self._span
+        )
+
+    def visit_tuple_getitem(self, op):
+        return _expr.TupleGetItemWithFields(
+            op, self.visit(op.tuple_value), op.index, None, self._span
+        )
+
+    def visit_constant(self, const):
+        return _expr.ConstantWithFields(const, const.data, None, self._span)
+
+    # TODO: Frontend model translation could not use following relay expressions so far,
+    #       enable them when new models/impls leverage these kinds of relay expressions.
+    def visit_ref_create(self, _):
+        raise NotImplementedError()
+
+    def visit_ref_write(self, _):
+        raise NotImplementedError()
+
+    def visit_ref_read(self, _):
+        raise NotImplementedError()
+
+    def visit_match(self, _):
+        raise NotImplementedError()
+
+    def fill(self, sym):
+        """Fill span to sym when it is an expr, or return it without change
+
+        Parameters
+        ----------
+        sym :
+            A symbol which is generated from the conversion of a frontend operator.
+
+        Returns
+        -------
+        sym:
+            A expr with span-filled or the original sym.
+        """
+        if isinstance(sym, _expr.TupleWrapper):
+            return _expr.TupleWrapper(self.visit(sym.tuple_value), sym.size)
+        elif isinstance(sym, _expr.RelayExpr):
+            return self.visit(sym)
+        elif isinstance(sym, list):
+            assert all(
+                isinstance(expr, _expr.RelayExpr) for expr in sym
+            ), f"unexpected relay expressions in {sym}"
+            return [self.visit(expr) for expr in sym]
+        elif isinstance(sym, tuple):
+            # some op conversion may return dummy elements
+            # e.g. op in frontend/pytorch.py: min_max_common
+            assert all(
+                isinstance(expr, (_expr.RelayExpr, type(None))) for expr in sym
+            ), f"unexpected relay expressions in {sym}"
+            return tuple(self.visit(expr) if expr else None for expr in sym)
+        elif isinstance(sym, (float, int)):
+            return sym
+        elif isinstance(sym, np.ndarray):
+            return sym
+        elif not sym:
+            # some op conversion may return None
+            # e.g. op in frontend/pytorch.py: prim::device
+            return sym
+
+        raise RuntimeError(f"unsupported type {type(sym)}")
+
+
+def set_span(sym, span):
+    """
+    Recursively tag the span to the symbol. Stop when it encounters a span-tagged expr. Disabled
+    when setting the "relay.frontend.fill_span" as False to the config of PassContext
+
+    Parameters
+    ----------
+    sym :
+        A symbol is generated from the conversion of a frontend operator. Raise an error when the
+        type of the symbol is not supported.
+
+    span : String, Span, or bytes
+        The source information of the corresponding symbol.
+
+    Returns
+    -------
+    result :
+        The symbol tagged with span.
+
+    Examples
+    --------
+    .. code-block:: python
+
+      x = set_span(relay.var("x", shape=(1, 64, 56, 56)), "x_var")
+      w = relay.const(np.ones([64, 64, 3, 3]), dtype="int64")
+      y = set_span(
+          relay.nn.conv2d(x, w, channels=64, kernel_size=(3, 3), padding=(1, 1)), "conv2d"
+      )
+      print(relay.Function([x], y))
+
+      #fn (%x: Tensor[(1, 64, 56, 56), float32] /* span=x_var:0:0 */) {
+      #  nn.conv2d(%x, meta[relay.Constant][0] /* span=conv2d:0:0 */, ...) /* span=conv2d:0:0 */
+      #}
+    """
+
+    if tvm.transform.PassContext.current().config.get("relay.frontend.fill_span", True):
+        return _SpanFiller(span).fill(sym)
+    return sym

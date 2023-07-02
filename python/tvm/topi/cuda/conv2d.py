@@ -25,7 +25,6 @@ from .. import nn, generic
 from ..nn.utils import get_pad_tuple
 from ..utils import get_const_tuple, traverse_inline
 from .conv2d_direct import schedule_direct_cuda
-from .conv2d_nhwc import schedule_conv2d_nhwc_direct
 
 
 @autotvm.register_topi_compute("conv2d_nchw.cuda")
@@ -48,26 +47,6 @@ def schedule_conv2d_nchw(cfg, outs):
     return s
 
 
-@autotvm.register_topi_compute("conv2d_nhwc.cuda")
-def conv2d_nhwc(cfg, data, kernel, strides, padding, dilation, out_dtype="float32"):
-    """Compute conv2d with NHWC layout"""
-    return nn.conv2d_nhwc(data, kernel, strides, padding, dilation, out_dtype)
-
-
-@autotvm.register_topi_schedule("conv2d_nhwc.cuda")
-def schedule_conv2d_nhwc(cfg, outs):
-    """Create the schedule for conv2d_nhwc"""
-    outs = [outs] if isinstance(outs, te.tensor.Tensor) else outs
-    s = te.create_schedule([x.op for x in outs])
-
-    def _callback(op):
-        if op.tag == "conv2d_nhwc":
-            schedule_conv2d_nhwc_direct(cfg, s, op.output(0))
-
-    traverse_inline(s, outs[0].op, _callback)
-    return s
-
-
 @autotvm.register_topi_compute("conv2d_cudnn.cuda")
 def conv2d_cudnn(
     cfg, data, kernel, strides, padding, dilation, groups=1, layout="NCHW", out_dtype="float32"
@@ -80,20 +59,19 @@ def conv2d_cudnn(
         tensor_format = 1  # CUDNN_TENSOR_NHWC
         N, H, W, _ = get_const_tuple(data.shape)
     else:
-        raise ValueError("Unsupported layout %s in cudnn" % layout)
+        raise ValueError(f"Unsupported layout {layout} in cudnn")
     CO, CI, KH, KW = get_const_tuple(kernel.shape)
 
     # handle dilation
     stride_h, stride_w = (strides, strides) if isinstance(strides, int) else strides
     dilation_h, dilation_w = (dilation, dilation) if isinstance(dilation, int) else dilation
+    KH_dilated = (KH - 1) * dilation_h + 1
+    KW_dilated = (KW - 1) * dilation_h + 1
 
-    if (
-        isinstance(padding, (list, tuple))
-        and len(padding) == 4
-        and (padding[0] != padding[2] or padding[1] != padding[3])
-    ):
+    pt, pl, pb, pr = get_pad_tuple(padding, (KH_dilated, KW_dilated))
+    if (pt != pb) or (pl != pr):
         raise ValueError("Cudnn doesn't support asymmetric padding.")
-    pt, pl, pb, pr = get_pad_tuple(padding, (KH, KW))
+
     OH = (H + pt + pb - KH) // stride_h + 1
     OW = (W + pl + pr - KW) // stride_w + 1
 
@@ -145,3 +123,28 @@ def conv2d_cudnn(
 def schedule_conv2d_cudnn(cfg, outs):
     """Create the schedule for conv2d_cudnn"""
     return generic.schedule_extern(outs)
+
+
+def conv2d_backward_weight_cudnn(
+    dy, x, kernel_size, padding, stride, dilation, groups, layout, output_dtype
+):
+    """Compute conv2d wgrad using CuDNN library"""
+    assert layout in ["NCHW", "NHWC"]
+
+    if dy.dtype == "float16":
+        # cuDNN does not seem to support other combination.
+        assert output_dtype == "float16", "Only supports fp16 output for cuDNN fp16 wgrad."
+
+    conv_dtype = "float32"  # Accumulation is always fp32
+    return cudnn.conv_backward_filter(
+        dy,
+        x,
+        kernel_size,
+        padding,
+        stride,
+        dilation,
+        conv_mode=1,
+        tensor_format=0 if layout == "NCHW" else 1,
+        conv_dtype=conv_dtype,
+        groups=groups,
+    )

@@ -45,11 +45,11 @@ TVM_REGISTER_GLOBAL("topi.max").set_body([](TVMArgs args, TVMRetValue* rv) {
 });
 
 TVM_REGISTER_GLOBAL("topi.argmin").set_body([](TVMArgs args, TVMRetValue* rv) {
-  *rv = topi::argmin(args[0], ArrayOrInt(args[1]), args[2]);
+  *rv = topi::argmin(args[0], ArrayOrInt(args[1]), args[2], false, args[3]);
 });
 
 TVM_REGISTER_GLOBAL("topi.argmax").set_body([](TVMArgs args, TVMRetValue* rv) {
-  *rv = topi::argmax(args[0], ArrayOrInt(args[1]), args[2]);
+  *rv = topi::argmax(args[0], ArrayOrInt(args[1]), args[2], false, args[3]);
 });
 
 TVM_REGISTER_GLOBAL("topi.prod").set_body([](TVMArgs args, TVMRetValue* rv) {
@@ -62,6 +62,10 @@ TVM_REGISTER_GLOBAL("topi.all").set_body([](TVMArgs args, TVMRetValue* rv) {
 
 TVM_REGISTER_GLOBAL("topi.any").set_body([](TVMArgs args, TVMRetValue* rv) {
   *rv = topi::any(args[0], ArrayOrInt(args[1]), args[2]);
+});
+
+TVM_REGISTER_GLOBAL("topi.collapse_sum").set_body([](TVMArgs args, TVMRetValue* rv) {
+  *rv = topi::collapse_sum(args[0], args[1]);
 });
 
 }  // namespace topi

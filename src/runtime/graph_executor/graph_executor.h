@@ -33,7 +33,9 @@
 
 #include <memory>
 #include <string>
+#include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -59,7 +61,7 @@ struct TVMOpParam {
 /*!
  * \brief Tiny graph executor.
  *
- *  This runtime can be acccesibly in various language via
+ *  This runtime can be accessible in various languages via
  *  TVM runtime PackedFunc API.
  */
 class TVM_DLL GraphExecutor : public ModuleNode {
@@ -71,19 +73,24 @@ class TVM_DLL GraphExecutor : public ModuleNode {
   };
 
  public:
+  using ShapeInfo = Map<String, ObjectRef>;
+  using DtypeInfo = Map<String, ObjectRef>;
   /*!
    * \brief Get member function to front-end
    * \param name The name of the function.
    * \param sptr_to_self The pointer to the module node.
    * \return The corresponding member function.
    */
-  virtual PackedFunc GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self);
+  virtual PackedFunc GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self);
 
   /*!
    * \return The type key of the executor.
    */
   const char* type_key() const final { return "GraphExecutor"; }
   void Run();
+
+  /*! \brief Get the property of the runtime module .*/
+  int GetPropertyMask() const final { return ModulePropertyMask::kRunnable; }
 
   /*!
    * \brief Initialize the graph executor with graph and device.
@@ -108,6 +115,25 @@ class TVM_DLL GraphExecutor : public ModuleNode {
   int GetInputIndex(const std::string& name);
 
   /*!
+   * \brief Get the input info of Graph by parsing the input nodes.
+   * \return The shape and dtype tuple.
+   */
+  std::tuple<ShapeInfo, DtypeInfo> GetInputInfo() const;
+
+  /*!
+   * \brief Get the output info of Graph by parsing the output nodes.
+   * \return The shape and dtype tuple.
+   */
+  std::tuple<ShapeInfo, DtypeInfo> GetOutputInfo() const;
+
+  /*!
+   * \brief Get the output index given the name of output.
+   * \param name The name of the output.
+   * \return The index of output.
+   */
+  int GetOutputIndex(const std::string& name);
+
+  /*!
    * \brief set index-th input to the graph.
    * \param index The input index.
    * \param data_in The input data.
@@ -119,6 +145,12 @@ class TVM_DLL GraphExecutor : public ModuleNode {
    * \param data_ref The input data that is referred.
    */
   void SetInputZeroCopy(int index, DLTensor* data_ref);
+  /*!
+   * \brief set index-th output to the graph without copying the data.
+   * \param index The output index.
+   * \param data_ref The output data that is referred.
+   */
+  void SetOutputZeroCopy(int index, DLTensor* data_ref);
   /*!
    * \brief Get the number of outputs
    *
@@ -181,10 +213,12 @@ class TVM_DLL GraphExecutor : public ModuleNode {
  protected:
   // Memory pool entry.
   struct PoolEntry {
-    size_t size;
     int device_type;
+    std::vector<int64_t> shape;
+    DLDataType dtype;
     int param_data_entry;
     NDArray linked_param;
+    std::string scope;
     //    PoolEntry(int s, int dev_type, void* pre_linked_param) :
     //        size(s), device_type(dev_type), pre_linked_param(std::move(pre_linked_param)) {}
   };
@@ -193,6 +227,9 @@ class TVM_DLL GraphExecutor : public ModuleNode {
     uint32_t node_id;
     uint32_t index;
     uint32_t version;
+    inline bool operator==(const NodeEntry& other) const {
+      return node_id == other.node_id && index == other.index && version == other.version;
+    }
     // JSON Loader
     void Load(dmlc::JSONReader* reader) {
       reader->BeginArray();
@@ -277,6 +314,7 @@ class TVM_DLL GraphExecutor : public ModuleNode {
     std::vector<int> storage_id;
     std::vector<int> device_index;
     std::vector<std::string> dltype;
+    std::vector<std::string> storage_scope;
     std::vector<std::vector<int64_t>> shape;
     // The graph attribute fields.
     void Load(dmlc::JSONReader* reader) {
@@ -302,6 +340,15 @@ class TVM_DLL GraphExecutor : public ModuleNode {
           reader->Read(&storage_id);
           ICHECK(!reader->NextArrayItem());
           bitmask |= 2;
+        } else if (key == "storage_scope") {
+          reader->BeginArray();
+          ICHECK(reader->NextArrayItem());
+          reader->Read(&type);
+          ICHECK_EQ(type, "list_str");
+          ICHECK(reader->NextArrayItem());
+          reader->Read(&storage_scope);
+          ICHECK(!reader->NextArrayItem());
+          bitmask |= 1;
         } else if (key == "shape") {
           reader->BeginArray();
           ICHECK(reader->NextArrayItem());
@@ -378,14 +425,19 @@ class TVM_DLL GraphExecutor : public ModuleNode {
   /*! \brief Setup the executors. */
   void SetupOpExecs();
   /*!
+   * \brief Check the legality of external DLTensor*.
+   * \param external The external DLTensor*.
+   * \param eid The data_enrty_ index.
+   */
+  void CheckExternalDLTensor(const DLTensor* external, uint32_t eid) const;
+  /*!
    * \brief Create an execution function given input.
    * \param attrs The node attributes.
    * \param args The arguments to the functor, including inputs and outputs.
-   * \param num_inputs Number of inputs.
    * \return The created executor.
    */
   std::pair<std::function<void()>, std::shared_ptr<OpArgs>> CreateTVMOp(
-      const TVMOpParam& attrs, const std::vector<DLTensor>& args, size_t num_inputs);
+      const TVMOpParam& attrs, const std::vector<DLTensor>& args);
   // Get node entry index.
   uint32_t entry_id(uint32_t nid, uint32_t index) const { return node_row_ptr_[nid] + index; }
   // Get node entry index.
@@ -396,10 +448,18 @@ class TVM_DLL GraphExecutor : public ModuleNode {
   std::vector<Node> nodes_;
   /*! \brief The argument nodes. */
   std::vector<uint32_t> input_nodes_;
+  /*! \brief The parameter names. */
+  std::unordered_set<std::string> param_names_;
   /*! \brief Map of input names to input indices. */
   std::unordered_map<std::string, uint32_t> input_map_;
+  /*! \brief Map of output names to output indices. */
+  std::unordered_map<std::string, uint32_t> output_map_;
   /*! \brief Used for quick node input DLTensor* lookup given an input eid. */
   std::vector<std::vector<DLTensor*>> input_dltensors_;
+  /*! \brief Used for quick node output DLTensor* lookup given an output eid. */
+  std::vector<std::vector<DLTensor*>> output_dltensors_;
+  /*! \brief Used for quick node(both model output and op input) DLTensor* lookup given an eid. */
+  std::vector<std::vector<DLTensor*>> both_output_opinput_dltensors_;
   /*! \brief Used for quick entry indexing. */
   std::vector<uint32_t> node_row_ptr_;
   /*! \brief Output entries. */

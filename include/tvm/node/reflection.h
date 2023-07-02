@@ -43,7 +43,7 @@ using runtime::ObjectPtr;
 using runtime::ObjectRef;
 
 /*!
- * \brief Visitor class for to get the attributesof a AST/IR node.
+ * \brief Visitor class to get the attributes of an AST/IR node.
  *  The content is going to be called for each field.
  *
  *  Each objects that wants reflection will need to implement
@@ -75,7 +75,7 @@ class AttrVisitor {
 /*!
  * \brief Virtual function table to support IR/AST node reflection.
  *
- * Functions are stored  in columar manner.
+ * Functions are stored in columnar manner.
  * Each column is a vector indexed by Object's type_index.
  */
 class ReflectionVTable {
@@ -134,7 +134,6 @@ class ReflectionVTable {
    * \brief Dispatch the SHashReduce function.
    * \param self The pointer to the object.
    * \param hash_reduce The hash reducer.
-   * \return the result.
    */
   void SHashReduce(const Object* self, SHashReducer hash_reduce) const;
   /*!
@@ -205,7 +204,7 @@ class ReflectionVTable::Registry {
   /*!
    * \brief Set fcreate function.
    * \param f The creator function.
-   * \return rference to self.
+   * \return Reference to self.
    */
   Registry& set_creator(FCreate f) {  // NOLINT(*)
     ICHECK_LT(type_index_, parent_->fcreate_.size());
@@ -215,7 +214,7 @@ class ReflectionVTable::Registry {
   /*!
    * \brief Set bytes repr function.
    * \param f The ReprBytes function.
-   * \return rference to self.
+   * \return Reference to self.
    */
   Registry& set_repr_bytes(FReprBytes f) {  // NOLINT(*)
     ICHECK_LT(type_index_, parent_->frepr_bytes_.size());
@@ -229,7 +228,7 @@ class ReflectionVTable::Registry {
 };
 
 #define TVM_REFLECTION_REG_VAR_DEF \
-  static TVM_ATTRIBUTE_UNUSED ::tvm::ReflectionVTable::Registry __make_reflectiion
+  static TVM_ATTRIBUTE_UNUSED ::tvm::ReflectionVTable::Registry __make_reflection
 
 /*!
  * \brief Directly register reflection VTable.
@@ -244,7 +243,7 @@ class ReflectionVTable::Registry {
  *    static constexpr const std::nullptr_t VisitAttrs = nullptr;
  *
  *    static void SHashReduce(const runtime::StringObj* key, SHashReducer hash_reduce) {
- *      hash_reduce->SHashReduceHashedValue(runtime::String::HashBytes(key->data, key->size));
+ *      hash_reduce->SHashReduceHashedValue(runtime::String::StableHashBytes(key->data, key->size));
  *    }
  *
  *    static bool SEqualReduce(const runtime::StringObj* lhs,
@@ -374,7 +373,7 @@ inline ReflectionVTable::Registry ReflectionVTable::Register() {
     fsequal_reduce_.resize(tindex + 1, nullptr);
     fshash_reduce_.resize(tindex + 1, nullptr);
   }
-  // functor that implemnts the redirection.
+  // functor that implements the redirection.
   fvisit_attrs_[tindex] = ::tvm::detail::SelectVisitAttrs<T, TraitName>::VisitAttrs;
 
   fsequal_reduce_[tindex] = ::tvm::detail::SelectSEqualReduce<T, TraitName>::SEqualReduce;
@@ -387,8 +386,7 @@ inline ReflectionVTable::Registry ReflectionVTable::Register() {
 inline void ReflectionVTable::VisitAttrs(Object* self, AttrVisitor* visitor) const {
   uint32_t tindex = self->type_index();
   if (tindex >= fvisit_attrs_.size() || fvisit_attrs_[tindex] == nullptr) {
-    LOG(FATAL) << "TypeError: " << self->GetTypeKey()
-               << " is not registered via TVM_REGISTER_NODE_TYPE";
+    return;
   }
   fvisit_attrs_[tindex](self, visitor);
 }
@@ -404,6 +402,12 @@ inline bool ReflectionVTable::GetReprBytes(const Object* self, std::string* repr
     return false;
   }
 }
+
+/*!
+ * \brief Given an object and an address of its attribute, return the key of the attribute.
+ * \return nullptr if no attribute with the given address exists.
+ */
+Optional<String> GetAttrKeyByAddress(const Object* object, const void* attr_address);
 
 }  // namespace tvm
 #endif  // TVM_NODE_REFLECTION_H_

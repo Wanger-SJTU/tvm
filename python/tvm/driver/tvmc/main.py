@@ -16,6 +16,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# pylint: disable=use-a-generator
 """
 TVMC - TVM driver command-line interface
 """
@@ -25,8 +26,11 @@ import sys
 
 import tvm
 
-from tvm.driver.tvmc.common import TVMCException
-
+from tvm.driver.tvmc import TVMCException, TVMCImportError
+from tvm.driver.tvmc.config_options import (
+    read_and_convert_json_into_dict,
+    convert_config_json_to_cli,
+)
 
 REGISTERED_PARSER = []
 
@@ -60,18 +64,33 @@ def _main(argv):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="TVM compiler driver",
         epilog=__doc__,
+        # Help action will be added later, after all subparsers are created,
+        # so it doesn't interfere with the creation of the dynamic subparsers.
+        add_help=False,
     )
+
+    parser.add_argument("--config", default="default", help="configuration json file")
+    config_arg, argv = parser.parse_known_args(argv)
+
+    json_param_dict = read_and_convert_json_into_dict(config_arg)
+    json_config_values = convert_config_json_to_cli(json_param_dict)
+
     parser.add_argument("-v", "--verbose", action="count", default=0, help="increase verbosity")
     parser.add_argument("--version", action="store_true", help="print the version and exit")
 
     subparser = parser.add_subparsers(title="commands")
     for make_subparser in REGISTERED_PARSER:
-        make_subparser(subparser)
+        make_subparser(subparser, parser, json_config_values)
+
+    # Finally, add help for the main parser.
+    parser.add_argument("-h", "--help", action="help", help="show this help message and exit.")
 
     args = parser.parse_args(argv)
-    if args.verbose > 4:
-        args.verbose = 4
+    args.verbose = min(args.verbose, 3)
 
+    # See the meaning of the logging levels at
+    # https://docs.python.org/3/library/logging.html#logging-levels
+    logging.basicConfig(stream=sys.stdout)
     logging.getLogger("TVMC").setLevel(40 - args.verbose * 10)
 
     if args.version:
@@ -85,6 +104,11 @@ def _main(argv):
 
     try:
         return args.func(args)
+    except TVMCImportError as err:
+        sys.stderr.write(
+            f'Package "{err}" is not installed. ' f'Hint: "pip install tlcpack[tvmc]".'
+        )
+        return 5
     except TVMCException as err:
         sys.stderr.write("Error: %s\n" % err)
         return 4

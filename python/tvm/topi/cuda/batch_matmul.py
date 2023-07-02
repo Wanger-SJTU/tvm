@@ -93,6 +93,8 @@ def schedule_batch_matmul(cfg, outs):
     def _schedule(cfg, op):
         C = op.output(0)
         A, B = s[C].op.input_tensors
+        if len(B.op.input_tensors) == 1 and B.op.input_tensors[0] == A:
+            s[B].compute_inline()
         _, M, N = get_const_tuple(C.shape)
         AA = s.cache_read(A, "shared", [C])
         AL = s.cache_read(AA, "local", [C])
@@ -227,7 +229,7 @@ def batch_matmul_cublas(
         b, k, n = get_const_tuple(y.shape)
     if all([isinstance(s, int) for s in [b, m, n, k]]):
         cfg.add_flop(b * m * k * n * 2)
-    return cublas.batch_matmul(x, y, transa=transpose_a, transb=transpose_b)
+    return cublas.batch_matmul(x, y, transa=transpose_a, transb=transpose_b, dtype=out_dtype)
 
 
 @autotvm.register_topi_schedule("batch_matmul_cublas.cuda")
@@ -237,7 +239,9 @@ def schedule_batch_matmul_cublas(_, outs):
 
 
 @autotvm.register_topi_compute("batch_matmul_int8.cuda")
-def batch_matmul_int8(cfg, x, y, out_shape=None, out_dtype=None):
+def batch_matmul_int8(
+    cfg, x, y, out_shape=None, out_dtype=None, transpose_a=False, transpose_b=True
+):
     """Batch Matmul operator for int8 on CUDA.
 
     Parameters
@@ -258,11 +262,20 @@ def batch_matmul_int8(cfg, x, y, out_shape=None, out_dtype=None):
     out_dtype : Optional[str]
         Specifies the output data type for mixed precision batch matmul.
 
+    transpose_a : Optional[bool] = False
+        Whether the first tensor is in transposed format.
+
+    transpose_b : Optional[bool] = True
+        Whether the second tensor is in transposed format.
+
     Returns
     -------
     output : tvm.te.Tensor
         3-D with shape [batch, M, N]
     """
+    del out_shape
+    # TODO(jcf94): Deal with different transpose combinations
+    assert not transpose_a and transpose_b
     if out_dtype is None:
         out_dtype = x.dtype
 
@@ -320,17 +333,16 @@ def schedule_batch_matmul_int8(cfg, outs):
     return s
 
 
-_dp4a = dp4a("shared", "shared", "local")
-
-
 def _schedule_batch_matmul_int8(cfg, s, output):
     input_x, input_y = s[output].op.input_tensors
+    if len(input_y.op.input_tensors) == 1 and input_y.op.input_tensors[0] == input_x:
+        s[input_y].compute_inline()
 
     B, M, K = get_const_tuple(input_x.shape)
     _, N, _ = get_const_tuple(input_y.shape)
 
     k_factor = 4
-    assert K % k_factor == 0, "Input dimension must divide {}".format(k_factor)
+    assert K % k_factor == 0, f"Input dimension must divide {k_factor}"
     if K % 16 == 0:
         k_factor = 16
 
@@ -340,7 +352,7 @@ def _schedule_batch_matmul_int8(cfg, s, output):
     cfg.define_split("tile_k", K // k_factor, num_outputs=2)
     cfg.define_knob("auto_unroll_max_step", [0, 256, 512, 1024])
 
-    batch_matmul_op = s.outputs[0]
+    batch_matmul_op = s[output].op
     s[input_x].compute_inline()
     s[input_y].compute_inline()
 
@@ -353,7 +365,17 @@ def _schedule_batch_matmul_int8(cfg, s, output):
     ko, ki = s[batch_matmul_cache].split(ko, factor=4)
     ko, kt = cfg["tile_k"].apply(s, batch_matmul_cache, ko)
     # dp4a tensorize
-    s[batch_matmul_cache].tensorize(ki, _dp4a)
+
+    target = tvm.target.Target.current(allow_none=False)
+    do_tensorize = "+dotprod" in target.mattr or target.supports_integer_dot_product
+
+    if do_tensorize:
+        dtypes = (input_x.dtype, input_y.dtype)
+        s[batch_matmul_cache].tensorize(ki, dp4a("shared", "shared", "local", dtypes))
+
+    if batch_matmul_op not in s.outputs:
+        s[output].compute_inline()
+        batch_matmul_op = s.outputs[0]
 
     # tile axis
     f, m, n = batch_matmul_op.axis

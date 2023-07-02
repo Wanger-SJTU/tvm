@@ -214,13 +214,7 @@ def _schedule_spatial_pack(cfg, s, op, layout):
         axis_lens = [VH, VW, VC]
 
     cfg["ann_spatial"].apply(
-        s,
-        conv,
-        unroll_vec_axes,
-        axis_lens,
-        max_unroll=max_unroll,
-        vec_size=vec_size,
-        cfg=cfg,
+        s, conv, unroll_vec_axes, axis_lens, max_unroll=max_unroll, vec_size=vec_size, cfg=cfg
     )
 
     # schedule output
@@ -433,13 +427,7 @@ def _schedule_winograd(cfg, s, op):
     if isinstance(U.op, tvm.te.ComputeOp):
         kernel, G = s[U].op.input_tensors
         s[G].compute_inline()
-        (
-            eps,
-            nu,
-            co,
-            ci,
-            vco,
-        ) = s[U].op.axis
+        (eps, nu, co, ci, vco) = s[U].op.axis
         if not autotvm.GLOBAL_SCOPE.in_tuning:
             r_kh, r_kw = s[U].op.reduce_axis
             s[U].reorder(co, ci, eps, nu, r_kh, r_kw, vco)
@@ -531,7 +519,7 @@ def _alter_conv2d_layout(attrs, inputs, tinfos, out_type):
     data, kernel = tinfos
     out_dtype = out_type.dtype
 
-    impl, outs = relay.backend.compile_engine.select_implementation(
+    impl, outs = relay.backend.te_compiler.select_implementation(
         relay.op.get("nn.conv2d"), attrs, tinfos, out_type, target
     )
     workload = autotvm.task.get_workload(outs)
@@ -577,7 +565,7 @@ def _alter_conv2d_layout(attrs, inputs, tinfos, out_type):
         CO, _, KH, KW = get_const_tuple(kernel.shape)
         VC = cfg["tile_co"].size[-1]
 
-        new_attrs["kernel_layout"] = "OIHW%do" % VC
+        new_attrs["kernel_layout"] = f"OIHW{VC}o"
 
         new_data = data
         new_kernel = te.placeholder((idxd(CO, VC), CI, KH, KW, VC), dtype=kernel.dtype)

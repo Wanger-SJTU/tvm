@@ -15,66 +15,104 @@
 # specific language governing permissions and limitations
 # under the License.
 # pylint: disable=missing-function-docstring,missing-module-docstring
-import tvm
-from tvm.script import ty
-from tvm import te, tir
-import numpy as np
-import tvm.testing
 import pytest
+import tvm
+import tvm.testing
+from tvm import tir
+from tvm.script import tir as T
 
 
-@tvm.script.tir
+@tvm.script.ir_module
 class Module:
+    @T.prim_func
+    def tvm_test_cpacked(
+        A: T.Buffer((1,), "float32"),
+        B: T.Buffer((1,), "float32"),
+        C: T.Buffer((1,), "float32"),
+        device_context: T.Buffer((1,), "float32"),
+    ) -> T.handle:
+        T.evaluate(C.data)
+
+    @T.prim_func
     def tir_packed_call() -> None:
-        A = tir.var("handle")
-        B = tir.var("handle")
-        C = tir.var("handle")
+        A = T.handle()
+        B = T.handle()
+        C = T.handle()
+        device_context = T.handle()
         # body
-        tir.evaluate(
-            tir.tvm_call_cpacked(
+        T.evaluate(
+            T.tvm_call_cpacked(
                 "tvm_test_cpacked",
                 A,
                 B,
                 C,
+                device_context,
                 dtype="int32",
             )
         )
 
 
-@tvm.script.tir
+@tvm.script.ir_module
 class Expected:
+    @T.prim_func
+    def tvm_test_cpacked(
+        A: T.Buffer((1,), "float32"),
+        B: T.Buffer((1,), "float32"),
+        C: T.Buffer((1,), "float32"),
+        device_context: T.Buffer((1,), "float32"),
+    ) -> T.handle:
+        T.evaluate(C.data)
+
+    @T.prim_func
     def tir_packed_call() -> None:
-        A = tir.var("handle")
-        B = tir.var("handle")
-        C = tir.var("handle")
+        A = T.handle()
+        B = T.handle()
+        C = T.handle()
+        device_context = T.handle()
 
         # body
-        tvm_value_2 = tir.var("handle")
-        tvm_value_1 = tir.var("handle")
-        tvm_value_0 = tir.var("handle")
-        with tir.let(tvm_value_2, tir.tvm_stack_alloca("array", 1, dtype="handle")):
-            with tir.let(tvm_value_1, tir.tvm_stack_alloca("array", 1, dtype="handle")):
-                with tir.let(tvm_value_0, tir.tvm_stack_alloca("array", 1, dtype="handle")):
-                    tir.evaluate(tir.tvm_struct_set(tvm_value_0, 0, 1, A, dtype="handle"))
-                    tir.evaluate(tir.tvm_struct_set(tvm_value_1, 0, 1, B, dtype="handle"))
-                    tir.evaluate(tir.tvm_struct_set(tvm_value_2, 0, 1, C, dtype="handle"))
-                    tir.evaluate(
-                        tir.tvm_call_cpacked(
-                            "tvm_test_cpacked",
-                            tvm_value_0,
-                            tvm_value_1,
-                            tvm_value_2,
-                            dtype="int32",
-                        )
-                    )
+        T.evaluate(
+            T.tvm_call_cpacked(
+                "tvm_test_cpacked",
+                T.tvm_stack_make_array(
+                    A,
+                    T.tvm_stack_make_shape(1, dtype="handle"),
+                    T.reinterpret(T.uint64(0), dtype="handle"),
+                    T.uint32(1),
+                    T.Cast("float32", 0),
+                    0,
+                    dtype="handle",
+                ),
+                T.tvm_stack_make_array(
+                    B,
+                    T.tvm_stack_make_shape(1, dtype="handle"),
+                    T.reinterpret(T.uint64(0), dtype="handle"),
+                    T.uint32(1),
+                    T.Cast("float32", 0),
+                    0,
+                    dtype="handle",
+                ),
+                T.tvm_stack_make_array(
+                    C,
+                    T.tvm_stack_make_shape(1, dtype="handle"),
+                    T.reinterpret(T.uint64(0), dtype="handle"),
+                    T.uint32(1),
+                    T.Cast("float32", 0),
+                    0,
+                    dtype="handle",
+                ),
+                device_context,
+                dtype="int32",
+            )
+        )
 
 
 def test_aot_packed_call():
-    mod = Module()
-    expected = Expected()
+    mod = Module
+    expected = Expected
     out = tir.transform.LegalizePackedCalls()(mod)
     tvm.ir.assert_structural_equal(expected, out, map_free_vars=True)
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    tvm.testing.main()

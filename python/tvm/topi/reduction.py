@@ -34,7 +34,7 @@ def _get_real_axis(ndim, axis):
                 ele += ndim
             if ele >= ndim:
                 raise ValueError(
-                    "{} exceeds the maximum dimension {}. Received axis={}".format(ele, ndim, axis)
+                    f"{ele} exceeds the maximum dimension {ndim}. Received axis={axis}"
                 )
             real_axis.append(ele)
         real_axis.sort()
@@ -167,7 +167,7 @@ def min(data, axis=None, keepdims=False):
     return cpp.min(data, axis, keepdims)
 
 
-def argmax(data, axis=None, keepdims=False):
+def argmax(data, axis=None, keepdims=False, select_last_index=False):
     """Returns the indices of the maximum values along an axis.
 
     Parameters
@@ -185,14 +185,18 @@ def argmax(data, axis=None, keepdims=False):
         with size one.
         With this option, the result will broadcast correctly against the input array.
 
+    select_last_index: bool
+        Whether to select the last index if the maximum element appears multiple times, else
+        select the first index.
+
     Returns
     -------
     ret : tvm.te.Tensor
     """
-    return cpp.argmax(data, axis, keepdims)
+    return cpp.argmax(data, axis, keepdims, select_last_index)
 
 
-def argmin(data, axis=None, keepdims=False):
+def argmin(data, axis=None, keepdims=False, select_last_index=False):
     """Returns the indices of the minimum values along an axis.
 
     Parameters
@@ -210,11 +214,15 @@ def argmin(data, axis=None, keepdims=False):
         with size one.
         With this option, the result will broadcast correctly against the input array.
 
+    select_last_index: bool
+        Whether to select the last index if the minimum element appears multiple times, else
+        select the first index.
+
     Returns
     -------
     ret : tvm.te.Tensor
     """
-    return cpp.argmin(data, axis, keepdims)
+    return cpp.argmin(data, axis, keepdims, select_last_index)
 
 
 def prod(data, axis=None, keepdims=False):
@@ -240,3 +248,34 @@ def prod(data, axis=None, keepdims=False):
     ret : tvm.te.Tensor
     """
     return cpp.prod(data, axis, keepdims)
+
+
+def collapse_sum(data, target_shape):
+    """Return a summation of data to the given shape.
+
+    collapse_sum is intended as the backward operator of topi broadcast operators in the automatic
+    differentiation process.
+
+    We expect that data is the result of broadcasting some tensor of target_shape in some
+    broadcast operation. Thus target_shape and data.shape must follow broadcast rules.
+
+    During computation, the axes of data.shape and target_shape are checked from right to left.
+    For every axis, if it either:
+    - exist in data but not in target_shape, or
+    - is larger than 1 in data and equals to 1 in target_shape,
+    data will be summed over this axis.
+
+    Parameters
+    ----------
+    data : tvm.te.Tensor
+        The input tensor.
+
+    shape : Tuple[int]
+        The shape to collapse to.
+
+    Returns
+    -------
+    ret : tvm.te.Tensor
+        The result tensor after summation.
+    """
+    return cpp.collapse_sum(data, target_shape)

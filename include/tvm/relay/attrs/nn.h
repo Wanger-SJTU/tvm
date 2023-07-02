@@ -55,9 +55,9 @@ struct Conv1DAttrs : public tvm::AttrsNode<Conv1DAttrs> {
   int groups;
   IndexExpr channels;
   Array<IndexExpr> kernel_size;
-  std::string data_layout;
-  std::string kernel_layout;
-  std::string out_layout;
+  tvm::String data_layout;
+  tvm::String kernel_layout;
+  tvm::String out_layout;
   DataType out_dtype;
 
   TVM_DECLARE_ATTRS(Conv1DAttrs, "relay.attrs.Conv1DAttrs") {
@@ -99,6 +99,12 @@ struct Conv1DAttrs : public tvm::AttrsNode<Conv1DAttrs> {
             "Dimension ordering of weight. Can be 'OIW', or 'WIO', etc."
             "'O', 'I', 'W' stands for num_filter, input_channel, and width"
             "dimensions respectively.");
+    TVM_ATTR_FIELD(out_layout)
+        .set_default("")
+        .describe(
+            "Dimension ordering of output. Can be 'NCW', 'NWC', etc."
+            "'N', 'C', 'W' stands for batch, channel, and width"
+            "dimensions respectively. Default to be same as input layout.");
 
     // use 0 bits to indicate none.
     TVM_ATTR_FIELD(out_dtype)
@@ -118,7 +124,8 @@ struct Conv2DAttrs : public tvm::AttrsNode<Conv2DAttrs> {
   tvm::String data_layout;
   tvm::String kernel_layout;
   tvm::String out_layout;
-  tvm::String auto_scheduler_rewritten_layout;  // The layout after auto-scheduler's layout rewrite
+  tvm::String auto_scheduler_rewritten_layout;   // The layout after auto-scheduler's layout rewrite
+  Array<PrimExpr> meta_schedule_original_shape;  // The original shape of the weights
   DataType out_dtype;
 
   TVM_DECLARE_ATTRS(Conv2DAttrs, "relay.attrs.Conv2DAttrs") {
@@ -211,7 +218,8 @@ struct Conv2DWinogradAttrs : public tvm::AttrsNode<Conv2DWinogradAttrs> {
   tvm::String data_layout;
   tvm::String kernel_layout;
   tvm::String out_layout;
-  tvm::String auto_scheduler_rewritten_layout;  // The layout after auto-scheduler's layout rewrite
+  tvm::String auto_scheduler_rewritten_layout;   // The layout after auto-scheduler's layout rewrite
+  Array<PrimExpr> meta_schedule_original_shape;  // The original shape of the weights
   DataType out_dtype;
 
   TVM_DECLARE_ATTRS(Conv2DWinogradAttrs, "relay.attrs.Conv2DWinogradAttrs") {
@@ -302,7 +310,8 @@ struct Conv3DAttrs : public tvm::AttrsNode<Conv3DAttrs> {
   tvm::String data_layout;
   tvm::String kernel_layout;
   tvm::String out_layout;
-  tvm::String auto_scheduler_rewritten_layout;  // The layout after auto-scheduler's layout rewrite
+  tvm::String auto_scheduler_rewritten_layout;   // The layout after auto-scheduler's layout rewrite
+  Array<PrimExpr> meta_schedule_original_shape;  // The original shape of the weights
   DataType out_dtype;
 
   TVM_DECLARE_ATTRS(Conv3DAttrs, "relay.attrs.Conv3DAttrs") {
@@ -371,9 +380,9 @@ struct Conv3DTransposeAttrs : public tvm::AttrsNode<Conv3DTransposeAttrs> {
   Array<IndexExpr> output_padding;
   Array<IndexExpr> dilation;
   int groups;
-  std::string data_layout;
-  std::string kernel_layout;
-  std::string out_layout;
+  tvm::String data_layout;
+  tvm::String kernel_layout;
+  tvm::String out_layout;
   DataType out_dtype;
 
   TVM_DECLARE_ATTRS(Conv3DTransposeAttrs, "relay.attrs.Conv3DTransposeAttrs") {
@@ -421,10 +430,10 @@ struct Conv3DTransposeAttrs : public tvm::AttrsNode<Conv3DTransposeAttrs> {
             "dimensions respectively. Convolution is applied on the 'D', 'H' and"
             "'W' dimensions.");
     TVM_ATTR_FIELD(kernel_layout)
-        .set_default("OIDHW")
+        .set_default("IODHW")
         .describe(
-            "Dimension ordering of data and weight. Can be 'OIDHW', 'OIDHW16o16i', etc."
-            "'O', 'I', 'D', 'H', 'W' stands for num_filter, input_channel, depth, height, and width"
+            "Dimension ordering of data and weight. Can be 'IODHW', 'IODHW16i16o', etc."
+            "'I', 'O', 'D', 'H', 'W' stands for input_channel, num_filter, depth, height, and width"
             "dimensions respectively.");
     TVM_ATTR_FIELD(out_layout)
         .set_default("")
@@ -579,10 +588,10 @@ struct Conv2DTransposeAttrs : public tvm::AttrsNode<Conv2DTransposeAttrs> {
             "dimensions respectively. Convolution is applied on the 'H' and"
             "'W' dimensions.");
     TVM_ATTR_FIELD(kernel_layout)
-        .set_default("OIHW")
+        .set_default("IOHW")
         .describe(
-            "Dimension ordering of data and weight. Can be 'OIHW', 'OIHW16o16i', etc."
-            "'O', 'I', 'H', 'W' stands for num_filter, input_channel, height, and width"
+            "Dimension ordering of data and weight. Can be 'IOHW', 'OIHW16o16i', etc."
+            "'I', 'O', 'H', 'W' stands for input_channel, num_filter, height, and width"
             "dimensions respectively.");
     TVM_ATTR_FIELD(out_layout)
         .set_default("")
@@ -662,10 +671,10 @@ struct Conv1DTransposeAttrs : public tvm::AttrsNode<Conv1DTransposeAttrs> {
             "dimensions respectively. Convolution is applied on the"
             "'W' dimension.");
     TVM_ATTR_FIELD(kernel_layout)
-        .set_default("OIW")
+        .set_default("IOW")
         .describe(
-            "Dimension ordering of data and weight. Can be 'OIW', 'OIW16o16i', etc."
-            "'O', 'I', 'W' stands for num_filter, input_channel, and width"
+            "Dimension ordering of data and weight. Can be 'IOW', 'IOW16o16i', etc."
+            "'I', 'O', 'W' stands for input_channel, num_filter and width"
             "dimensions respectively.");
     TVM_ATTR_FIELD(out_layout)
         .set_default("")
@@ -686,6 +695,7 @@ struct MaxPool2DAttrs : public tvm::AttrsNode<MaxPool2DAttrs> {
   Array<IndexExpr> padding;
   Array<IndexExpr> dilation;
   tvm::String layout;
+  tvm::String out_layout;
   bool ceil_mode;
 
   TVM_DECLARE_ATTRS(MaxPool2DAttrs, "relay.attrs.MaxPool2DAttrs") {
@@ -709,6 +719,13 @@ struct MaxPool2DAttrs : public tvm::AttrsNode<MaxPool2DAttrs> {
         "'N', 'C', 'H', 'W' stands for batch, channel, height, and width"
         "dimensions respectively. Pooling is applied on the 'H' and"
         "'W' dimensions.");
+    TVM_ATTR_FIELD(out_layout)
+        .set_default("")
+        .describe(
+            "Dimension ordering of output data. Can be 'NCHW', 'NHWC', etc."
+            "'N', 'C', 'H', 'W' stands for batch, channel, height, and width"
+            "dimensions respectively. Pooling is applied on the 'H' and"
+            "'W' dimensions.");
     TVM_ATTR_FIELD(ceil_mode).set_default(false).describe(
         "When true, will use ceil instead of floor to compute the output shape.");
   }
@@ -721,6 +738,7 @@ struct AvgPool2DAttrs : public tvm::AttrsNode<AvgPool2DAttrs> {
   Array<IndexExpr> padding;
   Array<IndexExpr> dilation;
   tvm::String layout;
+  tvm::String out_layout;
   bool ceil_mode;
   bool count_include_pad;
 
@@ -745,6 +763,13 @@ struct AvgPool2DAttrs : public tvm::AttrsNode<AvgPool2DAttrs> {
         "'N', 'C', 'H', 'W' stands for batch, channel, height, and width"
         "dimensions respectively. Pooling is applied on the 'H' and"
         "'W' dimensions.");
+    TVM_ATTR_FIELD(out_layout)
+        .set_default("")
+        .describe(
+            "Dimension ordering of output data. Can be 'NCHW', 'NHWC', etc."
+            "'N', 'C', 'H', 'W' stands for batch, channel, height, and width"
+            "dimensions respectively. Pooling is applied on the 'H' and"
+            "'W' dimensions.");
     TVM_ATTR_FIELD(ceil_mode).set_default(false).describe(
         "When true, will use ceil instead of floor to compute the output shape.");
     TVM_ATTR_FIELD(count_include_pad)
@@ -756,6 +781,7 @@ struct AvgPool2DAttrs : public tvm::AttrsNode<AvgPool2DAttrs> {
 /*! \brief Attributes for global pool operator */
 struct GlobalPool2DAttrs : public tvm::AttrsNode<GlobalPool2DAttrs> {
   tvm::String layout;
+  tvm::String out_layout;
 
   TVM_DECLARE_ATTRS(GlobalPool2DAttrs, "relay.attrs.GlobalPool2DAttrs") {
     TVM_ATTR_FIELD(layout).set_default("NCHW").describe(
@@ -763,6 +789,13 @@ struct GlobalPool2DAttrs : public tvm::AttrsNode<GlobalPool2DAttrs> {
         "'N', 'C', 'H', 'W' stands for batch, channel, height, and width"
         "dimensions respectively. Pooling is applied on the 'H' and"
         "'W' dimensions.");
+    TVM_ATTR_FIELD(out_layout)
+        .set_default("")
+        .describe(
+            "Dimension ordering of output data. Can be 'NCHW', 'NHWC', etc."
+            "'N', 'C', 'H', 'W' stands for batch, channel, height, and width"
+            "dimensions respectively. Pooling is applied on the 'H' and"
+            "'W' dimensions.");
   }
 };
 
@@ -770,6 +803,7 @@ struct GlobalPool2DAttrs : public tvm::AttrsNode<GlobalPool2DAttrs> {
 struct AdaptivePool1DAttrs : public tvm::AttrsNode<AdaptivePool1DAttrs> {
   Array<IndexExpr> output_size;
   std::string layout;
+  tvm::String out_layout;
 
   TVM_DECLARE_ATTRS(AdaptivePool1DAttrs, "relay.attrs.AdaptivePool1DAttrs") {
     TVM_ATTR_FIELD(output_size).set_default(Array<IndexExpr>({})).describe("Output width.");
@@ -778,6 +812,13 @@ struct AdaptivePool1DAttrs : public tvm::AttrsNode<AdaptivePool1DAttrs> {
         "'N', 'C', 'W' stands for batch, channel, and width"
         "dimensions respectively. Pooling is applied on the"
         "'W' dimension.");
+    TVM_ATTR_FIELD(out_layout)
+        .set_default("")
+        .describe(
+            "Dimension ordering of output data. Can be 'NCW', 'NWC', etc."
+            "'N', 'C', 'W' stands for batch, channel, and width"
+            "dimensions respectively. Pooling is applied on the"
+            "'W' dimension.");
   }
 };
 
@@ -785,6 +826,7 @@ struct AdaptivePool1DAttrs : public tvm::AttrsNode<AdaptivePool1DAttrs> {
 struct AdaptivePool2DAttrs : public tvm::AttrsNode<AdaptivePool2DAttrs> {
   Array<IndexExpr> output_size;
   std::string layout;
+  tvm::String out_layout;
 
   TVM_DECLARE_ATTRS(AdaptivePool2DAttrs, "relay.attrs.AdaptivePool2DAttrs") {
     TVM_ATTR_FIELD(output_size)
@@ -795,6 +837,13 @@ struct AdaptivePool2DAttrs : public tvm::AttrsNode<AdaptivePool2DAttrs> {
         "'N', 'C', 'H', 'W' stands for batch, channel, height, and width"
         "dimensions respectively. Pooling is applied on the 'H' and"
         "'W' dimensions.");
+    TVM_ATTR_FIELD(out_layout)
+        .set_default("")
+        .describe(
+            "Dimension ordering of output data. Can be 'NCHW', 'NHWC', etc."
+            "'N', 'C', 'H', 'W' stands for batch, channel, height, and width"
+            "dimensions respectively. Pooling is applied on the 'H' and"
+            "'W' dimensions.");
   }
 };
 
@@ -802,6 +851,7 @@ struct AdaptivePool2DAttrs : public tvm::AttrsNode<AdaptivePool2DAttrs> {
 struct AdaptivePool3DAttrs : public tvm::AttrsNode<AdaptivePool3DAttrs> {
   Array<IndexExpr> output_size;
   std::string layout;
+  tvm::String out_layout;
 
   TVM_DECLARE_ATTRS(AdaptivePool3DAttrs, "relay.attrs.AdaptivePool3DAttrs") {
     TVM_ATTR_FIELD(output_size)
@@ -812,6 +862,13 @@ struct AdaptivePool3DAttrs : public tvm::AttrsNode<AdaptivePool3DAttrs> {
         "'N', 'C', 'D', 'H', 'W' stands for batch, channel, depth, height, and width"
         "dimensions respectively. Pooling is applied on 'D', 'H' and"
         "'W' dimensions.");
+    TVM_ATTR_FIELD(out_layout)
+        .set_default("")
+        .describe(
+            "Dimension ordering of output data. Can be 'NCDHW', 'NDHWC', etc."
+            "'N', 'C', 'D', 'H', 'W' stands for batch, channel, depth, height, and width"
+            "dimensions respectively. Pooling is applied on 'D', 'H' and"
+            "'W' dimensions.");
   }
 };
 
@@ -822,6 +879,7 @@ struct MaxPool1DAttrs : public tvm::AttrsNode<MaxPool1DAttrs> {
   Array<IndexExpr> dilation;
   Array<IndexExpr> padding;
   std::string layout;
+  tvm::String out_layout;
   bool ceil_mode;
 
   TVM_DECLARE_ATTRS(MaxPool1DAttrs, "relay.attrs.MaxPool1DAttrs") {
@@ -836,14 +894,19 @@ struct MaxPool1DAttrs : public tvm::AttrsNode<MaxPool1DAttrs> {
         .set_default(Array<IndexExpr>({0}))
         .describe(
             "If padding is non-zero, then the input is implicitly zero-padded"
-            "Padding support both symmetric and asymmetric as"
-            "one int : same padding used on all sides"
-            "three int : back, bottom, right will use same padding as front, top, left"
-            "six int : padding width in the order of (front, top, left, back, bottom, right)");
+            "Padding supports both symmetric and asymmetric as"
+            "one int : same padding used on each side"
+            "two int : indicates left padding, right padding");
     TVM_ATTR_FIELD(layout).set_default("NCW").describe(
         "Dimension ordering of input data. Can be 'NCW', 'NWC', etc."
         "'N', 'C', 'W' stands for batch, channel, and width"
         "dimensions respectively. Pooling is applied on the 'W' dimensions.");
+    TVM_ATTR_FIELD(out_layout)
+        .set_default("")
+        .describe(
+            "Dimension ordering of output data. Can be 'NCW', 'NWC', etc."
+            "'N', 'C', 'W' stands for batch, channel, and width"
+            "dimensions respectively. Pooling is applied on the 'W' dimensions.");
     TVM_ATTR_FIELD(ceil_mode).set_default(false).describe(
         "When true, will use ceil instead of floor to compute the output shape.");
   }
@@ -856,6 +919,7 @@ struct AvgPool1DAttrs : public tvm::AttrsNode<AvgPool1DAttrs> {
   Array<IndexExpr> dilation;
   Array<IndexExpr> padding;
   std::string layout;
+  tvm::String out_layout;
   bool ceil_mode;
   bool count_include_pad;
 
@@ -871,14 +935,19 @@ struct AvgPool1DAttrs : public tvm::AttrsNode<AvgPool1DAttrs> {
         .set_default(Array<IndexExpr>({0}))
         .describe(
             "If padding is non-zero, then the input is implicitly zero-padded"
-            "Padding support both symmetric and asymmetric as"
-            "one int : same padding used on all sides"
-            "three int : back, bottom, right will use same padding as front, top, left"
-            "six int : padding width in the order of (front, top, left, back, bottom, right)");
+            "Padding supports both symmetric and asymmetric as"
+            "one int : same padding used on each side"
+            "two int : indicates left padding, right padding");
     TVM_ATTR_FIELD(layout).set_default("NCW").describe(
         "Dimension ordering of input data. Can be 'NCW', 'NHC', etc."
         "'N', 'C', 'W' stands for batch, channel, and width"
         "dimensions respectively. Pooling is applied on the 'W' dimension.");
+    TVM_ATTR_FIELD(out_layout)
+        .set_default("")
+        .describe(
+            "Dimension ordering of output data. Can be 'NCW', 'NHC', etc."
+            "'N', 'C', 'W' stands for batch, channel, and width"
+            "dimensions respectively. Pooling is applied on the 'W' dimension.");
     TVM_ATTR_FIELD(ceil_mode).set_default(false).describe(
         "When true, will use ceil instead of floor to compute the output shape.");
     TVM_ATTR_FIELD(count_include_pad)
@@ -894,6 +963,7 @@ struct MaxPool3DAttrs : public tvm::AttrsNode<MaxPool3DAttrs> {
   Array<IndexExpr> dilation;
   Array<IndexExpr> padding;
   std::string layout;
+  tvm::String out_layout;
   bool ceil_mode;
 
   TVM_DECLARE_ATTRS(MaxPool3DAttrs, "relay.attrs.MaxPool3DAttrs") {
@@ -917,6 +987,13 @@ struct MaxPool3DAttrs : public tvm::AttrsNode<MaxPool3DAttrs> {
         "'N', 'C', 'D', 'H', 'W' stands for batch, channel, depth, height, and width"
         "dimensions respectively. Pooling is applied on the 'D', 'H' and"
         "'W' dimensions.");
+    TVM_ATTR_FIELD(out_layout)
+        .set_default("")
+        .describe(
+            "Dimension ordering of output data. Can be 'NCDHW', 'NDHWC', etc."
+            "'N', 'C', 'D', 'H', 'W' stands for batch, channel, depth, height, and width"
+            "dimensions respectively. Pooling is applied on the 'D', 'H' and"
+            "'W' dimensions.");
     TVM_ATTR_FIELD(ceil_mode).set_default(false).describe(
         "When true, will use ceil instead of floor to compute the output shape.");
   }
@@ -929,6 +1006,7 @@ struct AvgPool3DAttrs : public tvm::AttrsNode<AvgPool3DAttrs> {
   Array<IndexExpr> dilation;
   Array<IndexExpr> padding;
   std::string layout;
+  tvm::String out_layout;
   bool ceil_mode;
   bool count_include_pad;
 
@@ -953,6 +1031,13 @@ struct AvgPool3DAttrs : public tvm::AttrsNode<AvgPool3DAttrs> {
         "'N', 'C', 'D', 'H', 'W' stands for batch, channel, depth, height, and width"
         "dimensions respectively. Pooling is applied on the 'D', 'H' and"
         "'W' dimensions.");
+    TVM_ATTR_FIELD(out_layout)
+        .set_default("")
+        .describe(
+            "Dimension ordering of output data. Can be 'NCDHW', 'NDHWC', etc."
+            "'N', 'C', 'D', 'H', 'W' stands for batch, channel, depth, height, and width"
+            "dimensions respectively. Pooling is applied on the 'D', 'H' and"
+            "'W' dimensions.");
     TVM_ATTR_FIELD(ceil_mode).set_default(false).describe(
         "When true, will use ceil instead of floor to compute the output shape.");
     TVM_ATTR_FIELD(count_include_pad)
@@ -967,7 +1052,9 @@ struct MatmulAttrs : public tvm::AttrsNode<MatmulAttrs> {
   DataType out_dtype;
   bool transpose_a;
   bool transpose_b;
-  tvm::String auto_scheduler_rewritten_layout;  // The layout after auto-scheduler's layout rewrite
+  // layout of B after auto-scheduler's layout rewrite
+  tvm::String auto_scheduler_rewritten_layout;
+  Array<PrimExpr> meta_schedule_original_shape;  // The original shape of the weights
 
   TVM_DECLARE_ATTRS(MatmulAttrs, "relay.attrs.MatmulAttrs") {
     TVM_ATTR_FIELD(units).describe("Number of hidden units of the dense transformation.");
@@ -990,7 +1077,9 @@ struct MatmulAttrs : public tvm::AttrsNode<MatmulAttrs> {
 /*! \brief Attributes for dense operator */
 struct DenseAttrs : public tvm::AttrsNode<DenseAttrs> {
   IndexExpr units;
-  tvm::String auto_scheduler_rewritten_layout;  // The layout after auto-scheduler's layout rewrite
+  // layout of B after auto-scheduler's layout rewrite
+  tvm::String auto_scheduler_rewritten_layout;
+  Array<PrimExpr> meta_schedule_original_shape;  // The original shape of the weights
   DataType out_dtype;
 
   TVM_DECLARE_ATTRS(DenseAttrs, "relay.attrs.DenseAttrs") {
@@ -1003,12 +1092,32 @@ struct DenseAttrs : public tvm::AttrsNode<DenseAttrs> {
   }
 };
 
+/*! \brief Attributes for dense_pack operator */
+struct DensePackAttrs : public tvm::AttrsNode<DensePackAttrs> {
+  IndexExpr units;
+  DataType out_dtype;
+  tvm::String weight_layout;
+
+  TVM_DECLARE_ATTRS(DensePackAttrs, "relay.attrs.DensePackAttrs") {
+    TVM_ATTR_FIELD(units).describe("Number of hidden units of the dense transformation.");
+
+    // use 0 bits to indicate none.
+    TVM_ATTR_FIELD(out_dtype)
+        .set_default(NullValue<DataType>())
+        .describe("Output data type, set to explicit type under mixed precision setting");
+    TVM_ATTR_FIELD(weight_layout)
+        .set_default("NC")
+        .describe("Dimension ordering of weight. Packed layouts, such as NC8n, are possible.");
+  }
+};
+
 /*! \brief Attributes for batch matmul operator. */
 struct BatchMatmulAttrs : public tvm::AttrsNode<BatchMatmulAttrs> {
   DataType out_dtype;
   bool transpose_a;
   bool transpose_b;
-  tvm::String auto_scheduler_rewritten_layout;  // The layout after auto-scheduler's layout rewrite
+  tvm::String auto_scheduler_rewritten_layout;   // The layout after auto-scheduler's layout rewrite
+  Array<PrimExpr> meta_schedule_original_shape;  // The original shape of the weights
 
   TVM_DECLARE_ATTRS(BatchMatmulAttrs, "relay.attrs.BatchMatmulAttrs") {
     // use 0 bits to indicate none.
@@ -1047,12 +1156,16 @@ struct SparseTransposeAttrs : public tvm::AttrsNode<SparseTransposeAttrs> {
 /*! \brief Attributes for sparse_dense operator */
 struct SparseConv2DAttrs : public tvm::AttrsNode<SparseConv2DAttrs> {
   std::string layout;
+  Array<IndexExpr> kernel_size;
 
   TVM_DECLARE_ATTRS(SparseConv2DAttrs, "relay.attrs.SparseConv2DAttrs") {
     TVM_ATTR_FIELD(layout).set_default("NHWC").describe(
         "Dimension ordering of input data. Can be 'NCHW', 'NHWC'"
         "'N', 'C', 'H', 'W' stands for batch, channel, height, and width"
         "dimensions respectively.");
+    TVM_ATTR_FIELD(kernel_size)
+        .set_default(Array<IndexExpr>{1, 1})
+        .describe("Kernel size for SparseConv2D, 1x1 or 3x3. ");
   }
 };
 
@@ -1131,7 +1244,7 @@ struct UpSampling3DAttrs : public tvm::AttrsNode<UpSampling3DAttrs> {
 /*! \brief Attributes used for the padding operator */
 struct PadAttrs : public tvm::AttrsNode<PadAttrs> {
   Array<Array<Integer>> pad_width;
-  std::string pad_mode;
+  tvm::String pad_mode;
 
   TVM_DECLARE_ATTRS(PadAttrs, "relay.attrs.PadAttrs") {
     TVM_ATTR_FIELD(pad_width).describe(

@@ -17,14 +17,12 @@
 # pylint: disable=invalid-name
 """Utilities"""
 import logging
-import multiprocessing
 import time
-
-from random import randrange
 
 import numpy as np
 import tvm.arith
 from tvm.tir import expr
+from tvm.contrib.popen_pool import PopenPoolExecutor
 
 logger = logging.getLogger("autotvm")
 
@@ -57,36 +55,6 @@ def get_rank(values):
     return ranks
 
 
-def sample_ints(low, high, m):
-    """
-    Sample m different integer numbers from [low, high) without replacement
-    This function is an alternative of `np.random.choice` when (high - low) > 2 ^ 32, in
-    which case numpy does not work.
-
-    Parameters
-    ----------
-    low: int
-        low point of sample range
-    high: int
-        high point of sample range
-    m: int
-        The number of sampled int
-
-    Returns
-    -------
-    ints: an array of size m
-    """
-    vis = set()
-    assert m <= high - low
-    while len(vis) < m:
-        new = randrange(low, high)
-        while new in vis:
-            new = randrange(low, high)
-        vis.add(new)
-
-    return list(vis)
-
-
 def pool_map(func, args, batch_size, verbose=False, pool=None):
     """A wrapper of multiprocessing.pool.Pool.map to support small-batch mapping
     for large argument list. This can reduce memory usage
@@ -111,7 +79,7 @@ def pool_map(func, args, batch_size, verbose=False, pool=None):
 
     ret = None
     tic = time.time()
-    local_pool = pool or multiprocessing.Pool()
+    local_pool = pool or PopenPoolExecutor()
     if verbose:
         logger.info("mapping begin")
     for i in range(0, len(args), batch_size):

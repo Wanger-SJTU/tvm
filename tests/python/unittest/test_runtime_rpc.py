@@ -17,7 +17,6 @@
 import tvm
 from tvm import te
 import tvm.testing
-import logging
 import multiprocessing
 import os
 import stat
@@ -27,13 +26,15 @@ import time
 import pytest
 import numpy as np
 from tvm import rpc
+from tvm.relay.backend import Runtime
 from tvm.contrib import utils, cc
 from tvm.rpc.tracker import Tracker
+from tvm.rpc.proxy import Proxy
 
 
 if __name__ == "__main__":
     # NOTE: must live here to avoid registering PackedFunc with libtvm.so twice.
-    sys.exit(pytest.main([__file__] + sys.argv[1:]))
+    tvm.testing.main()
 
 
 # tkonolige: The issue as I understand it is this: multiprocessing's spawn
@@ -52,6 +53,9 @@ pytestmark = pytest.mark.skipif(
         "not work on the rpc.Server."
     ),
 )
+
+# NOTE: When writing tests, wrap remote related checking in a sub-function
+# to ensure all the remote resources destructs before the server terminates
 
 
 @tvm.testing.requires_rpc
@@ -90,38 +94,68 @@ def test_bigendian_rpc():
 def test_rpc_simple():
     server = rpc.Server(key="x1")
     client = rpc.connect("127.0.0.1", server.port, key="x1")
-    f1 = client.get_function("rpc.test.addone")
-    assert f1(10) == 11
-    f3 = client.get_function("rpc.test.except")
 
-    with pytest.raises(tvm._ffi.base.TVMError):
-        f3("abc")
+    def check_remote():
+        f1 = client.get_function("rpc.test.addone")
+        assert f1(10) == 11
+        f3 = client.get_function("rpc.test.except")
 
-    f2 = client.get_function("rpc.test.strcat")
-    assert f2("abc", 11) == "abc:11"
+        with pytest.raises(tvm._ffi.base.TVMError):
+            f3("abc")
+
+        f2 = client.get_function("rpc.test.strcat")
+        assert f2("abc", 11) == "abc:11"
+
+    check_remote()
+
+
+@tvm.testing.requires_rpc
+def test_rpc_simple_wlog():
+    server = rpc.Server(key="x1")
+    client = rpc.connect("127.0.0.1", server.port, key="x1", enable_logging=True)
+
+    def check_remote():
+        f1 = client.get_function("rpc.test.addone")
+        assert f1(10) == 11
+        f3 = client.get_function("rpc.test.except")
+
+        with pytest.raises(tvm._ffi.base.TVMError):
+            f3("abc")
+
+        f2 = client.get_function("rpc.test.strcat")
+        assert f2("abc", 11) == "abc:11"
+
+    check_remote()
 
 
 @tvm.testing.requires_rpc
 def test_rpc_runtime_string():
     server = rpc.Server(key="x1")
     client = rpc.connect("127.0.0.1", server.port, key="x1")
-    func = client.get_function("rpc.test.runtime_str_concat")
-    x = tvm.runtime.container.String("abc")
-    y = tvm.runtime.container.String("def")
-    assert str(func(x, y)) == "abcdef"
+
+    def check_remote():
+        func = client.get_function("rpc.test.runtime_str_concat")
+        x = tvm.runtime.container.String("abc")
+        y = tvm.runtime.container.String("def")
+        assert str(func(x, y)) == "abcdef"
+
+    check_remote()
 
 
 @tvm.testing.requires_rpc
 def test_rpc_array():
-    x = np.ones((3, 4))
-
     server = rpc.Server()
     remote = rpc.connect("127.0.0.1", server.port)
-    r_cpu = tvm.nd.array(x, remote.cpu(0))
-    assert str(r_cpu.device).startswith("remote")
-    np.testing.assert_equal(r_cpu.numpy(), x)
-    fremote = remote.get_function("rpc.test.remote_array_func")
-    fremote(r_cpu)
+
+    def check_remote():
+        x = np.ones((3, 4))
+        r_cpu = tvm.nd.array(x, remote.cpu(0))
+        assert str(r_cpu.device).startswith("remote")
+        np.testing.assert_equal(r_cpu.numpy(), x)
+        fremote = remote.get_function("rpc.test.remote_array_func")
+        fremote(r_cpu)
+
+    check_remote()
 
 
 @tvm.testing.requires_rpc
@@ -129,18 +163,23 @@ def test_rpc_large_array():
     # testcase of large array creation
     server = rpc.Server()
     remote = rpc.connect("127.0.0.1", server.port)
-    dev = remote.cpu(0)
-    a_np = np.ones((5041, 720)).astype("float32")
-    b_np = np.ones((720, 192)).astype("float32")
-    a = tvm.nd.array(a_np, dev)
-    b = tvm.nd.array(b_np, dev)
-    np.testing.assert_equal(a.numpy(), a_np)
-    np.testing.assert_equal(b.numpy(), b_np)
+
+    def check_remote():
+        dev = remote.cpu(0)
+        a_np = np.ones((5041, 720)).astype("float32")
+        b_np = np.ones((720, 192)).astype("float32")
+        a = tvm.nd.array(a_np, dev)
+        b = tvm.nd.array(b_np, dev)
+        np.testing.assert_equal(a.numpy(), a_np)
+        np.testing.assert_equal(b.numpy(), b_np)
+
+    check_remote()
 
 
+@tvm.testing.skip_if_32bit(reason="skipping test for i386.")
 @tvm.testing.requires_rpc
 def test_rpc_echo():
-    def check(remote):
+    def check(remote, local_session):
         fecho = remote.get_function("testing.echo")
         assert fecho(1, 2, 3) == 1
         assert fecho(100, 2, 3) == 100
@@ -152,15 +191,19 @@ def test_rpc_echo():
             raise_err()
 
         remote.cpu().sync()
-        with pytest.raises(AttributeError):
-            f3 = remote.system_lib()["notexist"]
+        # tests around system lib are not threadsafe by design
+        # and do not work well with multithread pytest
+        # skip local session as they are being tested elsewhere
+        if not local_session:
+            with pytest.raises(AttributeError):
+                f3 = remote.system_lib()["notexist"]
 
     temp = rpc.server._server_env([])
     server = rpc.Server()
     client = rpc.connect("127.0.0.1", server.port)
-    check(rpc.LocalSession())
+    check(rpc.LocalSession(), True)
 
-    check(client)
+    check(client, False)
 
     def check_minrpc():
         if tvm.get_global_func("rpc.CreatePipeClient", allow_missing=True) is None:
@@ -169,7 +212,7 @@ def test_rpc_echo():
         temp = utils.tempdir()
         minrpc_exec = temp.relpath("minrpc")
         tvm.rpc.with_minrpc(cc.create_executable)(minrpc_exec, [])
-        check(rpc.PopenSession(minrpc_exec))
+        check(rpc.PopenSession(minrpc_exec), False)
         # minrpc on the remote
         server = rpc.Server()
         client = rpc.connect(
@@ -177,7 +220,7 @@ def test_rpc_echo():
             server.port,
             session_constructor_args=["rpc.PopenSession", open(minrpc_exec, "rb").read()],
         )
-        check(client)
+        check(client, False)
 
     check_minrpc()
 
@@ -186,10 +229,14 @@ def test_rpc_echo():
 def test_rpc_file_exchange():
     server = rpc.Server()
     remote = rpc.connect("127.0.0.1", server.port)
-    blob = bytearray(np.random.randint(0, 10, size=(10)))
-    remote.upload(blob, "dat.bin")
-    rev = remote.download("dat.bin")
-    assert rev == blob
+
+    def check_remote():
+        blob = bytearray(np.random.randint(0, 10, size=(10)))
+        remote.upload(blob, "dat.bin")
+        rev = remote.download("dat.bin")
+        assert rev == blob
+
+    check_remote()
 
 
 @tvm.testing.requires_rpc
@@ -208,7 +255,7 @@ def test_rpc_remote_module():
         "127.0.0.1",
         server0.port,
         key="x0",
-        session_constructor_args=["rpc.Connect", "127.0.0.1", server1.port, "x1"],
+        session_constructor_args=["rpc.Connect", "127.0.0.1", server1.port, "x1", False],
     )
 
     def check_remote(remote):
@@ -244,7 +291,8 @@ def test_rpc_remote_module():
             return
         # export to minrpc
         temp = utils.tempdir()
-        f = tvm.build(s, [A, B], "llvm --system-lib", name="myadd")
+        runtime = Runtime("cpp", {"system-lib": True})
+        f = tvm.build(s, [A, B], "llvm", name="myadd", runtime=runtime)
         path_minrpc = temp.relpath("dev_lib.minrpc")
         f.export_library(path_minrpc, rpc.with_minrpc(cc.create_executable))
 
@@ -321,9 +369,13 @@ def test_rpc_remote_module():
 def test_rpc_return_func():
     server = rpc.Server(key="x1")
     client = rpc.connect("127.0.0.1", server.port, key="x1")
-    f1 = client.get_function("rpc.test.add_to_lhs")
-    fadd = f1(10)
-    assert fadd(12) == 22
+
+    def check_remote():
+        f1 = client.get_function("rpc.test.add_to_lhs")
+        fadd = f1(10)
+        assert fadd(12) == 22
+
+    check_remote()
 
 
 @tvm.testing.requires_rpc
@@ -338,7 +390,7 @@ def test_rpc_session_constructor_args():
             "127.0.0.1",
             server0.port,
             key="x0",
-            session_constructor_args=["rpc.Connect", "127.0.0.1", server1.port, "x1"],
+            session_constructor_args=["rpc.Connect", "127.0.0.1", server1.port, "x1", False],
         )
 
         fecho = client.get_function("testing.echo")
@@ -386,21 +438,25 @@ def test_rpc_return_ndarray():
 @tvm.testing.requires_rpc
 def test_local_func():
     client = rpc.LocalSession()
-    f1 = client.get_function("rpc.test.add_to_lhs")
-    fadd = f1(10)
-    assert fadd(12) == 22
 
-    blob = bytearray(np.random.randint(0, 10, size=(10)))
-    client.upload(blob, "dat.bin")
-    rev = client.download("dat.bin")
-    assert rev == blob
+    def check_remote():
+        f1 = client.get_function("rpc.test.add_to_lhs")
+        fadd = f1(10)
+        assert fadd(12) == 22
+
+        blob = bytearray(np.random.randint(0, 10, size=(10)))
+        client.upload(blob, "dat.bin")
+        rev = client.download("dat.bin")
+        assert rev == blob
+
+    check_remote()
 
 
 @tvm.testing.requires_rpc
-def test_rpc_tracker_register():
+@pytest.mark.parametrize("device_key", ["test_device", "127.0.0.1:5555"])
+def test_rpc_tracker_register(device_key):
     # test registration
     tracker = Tracker(port=9000, port_end=10000)
-    device_key = "test_device"
     server1 = rpc.Server(
         host="127.0.0.1",
         port=9000,
@@ -470,10 +526,10 @@ def _target(host, port, device_key, timeout):
 
 
 @tvm.testing.requires_rpc
-def test_rpc_tracker_request():
+@pytest.mark.parametrize("device_key", ["test_device", "127.0.0.1:5555"])
+def test_rpc_tracker_request(device_key):
     # test concurrent request
     tracker = Tracker(port=9000, port_end=10000)
-    device_key = "test_device"
     server = rpc.Server(
         port=9000,
         port_end=10000,
@@ -507,4 +563,77 @@ def test_rpc_tracker_request():
     proc2.terminate()
     proc2.join()
     server.terminate()
+    tracker.terminate()
+
+
+@tvm.testing.requires_rpc
+@pytest.mark.parametrize("device_key", ["test_device", "127.0.0.1:5555"])
+def test_rpc_tracker_via_proxy(device_key):
+    """
+         tracker
+         /     \
+    Host   --   Proxy -- RPC server
+    """
+
+    tracker_server = Tracker(port=9000, port_end=9100)
+    proxy_server = Proxy(
+        host=tracker_server.host,
+        port=8888,
+        port_end=8988,
+        tracker_addr=(tracker_server.host, tracker_server.port),
+    )
+
+    server1 = rpc.Server(
+        host=proxy_server.host,
+        port=proxy_server.port,
+        key=device_key,
+        tracker_addr=(tracker_server.host, tracker_server.port),
+        is_proxy=True,
+    )
+    server2 = rpc.Server(
+        host=proxy_server.host,
+        port=proxy_server.port,
+        key=device_key,
+        tracker_addr=(tracker_server.host, tracker_server.port),
+        is_proxy=True,
+    )
+
+    client = rpc.connect_tracker(tracker_server.host, tracker_server.port)
+    remote1 = client.request(device_key, session_timeout=30)  # pylint: disable=unused-variable
+    remote2 = client.request(device_key, session_timeout=30)  # pylint: disable=unused-variable
+
+    server2.terminate()
+    server1.terminate()
+    proxy_server.terminate()
+    tracker_server.terminate()
+
+
+@tvm.testing.requires_rpc
+@pytest.mark.parametrize("with_proxy", (True, False))
+def test_rpc_session_timeout_error(with_proxy):
+    port = 9000
+    port_end = 10000
+
+    tracker = Tracker(port=port, port_end=port_end)
+    time.sleep(0.5)
+    tracker_addr = (tracker.host, tracker.port)
+
+    if with_proxy:
+        proxy = Proxy(host="0.0.0.0", port=port, port_end=port_end, tracker_addr=tracker_addr)
+        time.sleep(0.5)
+        server = rpc.Server(host=proxy.host, port=proxy.port, is_proxy=True, key="x1")
+    else:
+        server = rpc.Server(port=port, port_end=port_end, tracker_addr=tracker_addr, key="x1")
+    time.sleep(0.5)
+
+    rpc_sess = rpc.connect_tracker(*tracker_addr).request(key="x1", session_timeout=1)
+
+    with pytest.raises(tvm.error.RPCSessionTimeoutError):
+        f1 = rpc_sess.get_function("rpc.test.addone")
+        time.sleep(2)
+        f1(10)
+
+    server.terminate()
+    if with_proxy:
+        proxy.terminate()
     tracker.terminate()

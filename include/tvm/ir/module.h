@@ -27,8 +27,8 @@
 #include <tvm/ir/adt.h>
 #include <tvm/ir/expr.h>
 #include <tvm/ir/function.h>
+#include <tvm/ir/source_map.h>
 #include <tvm/ir/type.h>
-#include <tvm/parser/source_map.h>
 #include <tvm/runtime/container/array.h>
 #include <tvm/runtime/container/map.h>
 #include <tvm/runtime/container/string.h>
@@ -36,10 +36,13 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace tvm {
+
 class IRModule;
+
 /*!
  * \brief IRModule that holds functions and type definitions.
  *
@@ -57,7 +60,81 @@ class IRModuleNode : public Object {
   /*! \brief A map from global type vars to ADT type data. */
   Map<GlobalTypeVar, TypeData> type_definitions;
   /*! \brief The source map for the module. */
-  parser::SourceMap source_map;
+  SourceMap source_map;
+  /* \brief Additional attributes storing meta-data about the module. */
+  DictAttrs attrs;
+  /*!
+   * \brief A map from string names to global variables that
+   * ensures global uniqueness.
+   */
+  Map<String, GlobalVar> global_var_map_;
+
+  /*! \brief A map from string names to global type variables (ADT names)
+   * that ensures global uniqueness.
+   */
+  Map<String, GlobalTypeVar> global_type_var_map_;
+
+  /*! \brief A map from constructor tags to constructor objects
+   * for convenient access
+   */
+  std::unordered_map<int32_t, Constructor> constructor_tag_map_;
+
+  /*! \brief The files previously imported, required to ensure
+      importing is idempotent for each module.
+   */
+  std::unordered_set<String> import_set_;
+
+  /*!
+   * \brief Get a module attribute.
+   *
+   * \param attr_key The attribute key.
+   * \param default_value The default value if the key does not exist, defaults to nullptr.
+   *
+   * \return The result
+   *
+   * \tparam TOBjectRef the expected object type.
+   * \throw Error if the key exists but the value does not match TObjectRef
+   *
+   * \code
+   *
+   *  void GetAttrExample(const IRModule& mod) {
+   *    auto value = f->GetAttr<Integer>("AttrKey", 0);
+   *  }
+   *
+   * \endcode
+   */
+  template <typename TObjectRef>
+  Optional<TObjectRef> GetAttr(
+      const std::string& attr_key,
+      Optional<TObjectRef> default_value = Optional<TObjectRef>(nullptr)) const {
+    return attrs.GetAttr(attr_key, default_value);
+  }
+  // variant that uses TObjectRef to enable implicit conversion to default value.
+  template <typename TObjectRef>
+  Optional<TObjectRef> GetAttr(const std::string& attr_key, TObjectRef default_value) const {
+    return GetAttr<TObjectRef>(attr_key, Optional<TObjectRef>(default_value));
+  }
+
+  /*!
+   * \brief Check whether the module has an non-zero integer attr.
+   *
+   * This function can be used to check whether an optional
+   * attribute mark(e.g. inline) exists.
+   *
+   * \param attr_key The key to the attribute.
+   * \return The check result.
+   *
+   * \code
+   *
+   *  void HasNonzeroAttrExample(const IRModule& mod) {
+   *    if (mod->HasNonzeroAttr(attr::kInline)) {
+   *      // inline the function.
+   *    }
+   *  }
+   *
+   * \endcode
+   */
+  bool HasNonzeroAttr(const std::string& attr_key) const { return attrs.HasNonzeroAttr(attr_key); }
 
   IRModuleNode() : source_map() {}
 
@@ -67,6 +144,7 @@ class IRModuleNode : public Object {
     v->Visit("global_var_map_", &global_var_map_);
     v->Visit("global_type_var_map_", &global_type_var_map_);
     v->Visit("source_map", &source_map);
+    v->Visit("attrs", &attrs);
   }
 
   TVM_DLL bool SEqualReduce(const IRModuleNode* other, SEqualReducer equal) const;
@@ -223,6 +301,12 @@ class IRModuleNode : public Object {
   TVM_DLL void Update(const IRModule& other);
 
   /*!
+   * \brief Create a shallow copy of this IRModule.
+   * \returns The shallow copy of the IRModule.
+   */
+  TVM_DLL IRModule ShallowCopy();
+
+  /*!
    * \brief Import Relay code from the file at path.
    * \param path The path of the Relay code to import.
    *
@@ -244,6 +328,8 @@ class IRModuleNode : public Object {
    */
   TVM_DLL std::unordered_set<String> Imports() const;
 
+  TVM_OBJECT_ENABLE_SCRIPT_PRINTER();
+
   static constexpr const char* _type_key = "IRModule";
   static constexpr const bool _type_has_method_sequal_reduce = true;
   static constexpr const bool _type_has_method_shash_reduce = true;
@@ -252,26 +338,6 @@ class IRModuleNode : public Object {
  private:
   /*! \brief Helper function for registering a typedef's constructors */
   void RegisterConstructors(const GlobalTypeVar& var, const TypeData& type);
-
-  /*! \brief A map from string names to global variables that
-   * ensures global uniqueness.
-   */
-  Map<String, GlobalVar> global_var_map_;
-
-  /*! \brief A map from string names to global type variables (ADT names)
-   * that ensures global uniqueness.
-   */
-  Map<String, GlobalTypeVar> global_type_var_map_;
-
-  /*! \brief A map from constructor tags to constructor objects
-   * for convenient access
-   */
-  std::unordered_map<int32_t, Constructor> constructor_tag_map_;
-
-  /*! \brief The files previously imported, required to ensure
-      importing is idempotent for each module.
-   */
-  std::unordered_set<String> import_set_;
   friend class IRModule;
 };
 
@@ -285,12 +351,14 @@ class IRModule : public ObjectRef {
    * \brief constructor
    * \param functions Functions in the module.
    * \param type_definitions Type definitions in the module.
-   * \param import_set Set of imported files in the module
+   * \param import_set Set of imported files in the module.
    * \param map The module source map.
+   * \param attrs The module attributes.
    */
   TVM_DLL explicit IRModule(Map<GlobalVar, BaseFunc> functions,
                             Map<GlobalTypeVar, TypeData> type_definitions = {},
-                            std::unordered_set<String> import_set = {}, parser::SourceMap map = {});
+                            std::unordered_set<String> import_set = {}, SourceMap map = {},
+                            DictAttrs attrs = {});
 
   /*! \brief default constructor */
   IRModule() : IRModule(Map<GlobalVar, BaseFunc>({})) {}
@@ -307,16 +375,38 @@ class IRModule : public ObjectRef {
   }
 
   /*!
-   * \brief Construct a module from a standalone expression.
+   * \brief Constructs a module from a standalone expression \p expr.
    *
-   * Allows one to optionally pass a global function map and
-   * map of type definitions as well.
+   * If \p expr is a function it will be bound directly. Otherwise a function over the free
+   * variables of \p expr (possibly none) with \p expr as body is created and bound.
+   *
+   * The function is bound to, in preference order:
+   *  - The "global_symbol" attribute of \p expr, if it is a function with that attribute.
+   *  - 'main'
+   *  - A unique name derived from 'main' if 'main' is already bound in \p global_funcs.
+   *
+   * Additional global functions and type definitions may be included in the result module.
+   *
+   * See also \p FromExpr.
    *
    * \param expr The expression to set as the main function to the module.
-   * \param global_funcs The global function map.
-   * \param type_definitions Map of global type definitions
+   * \param global_funcs The global function map. Default empty.
+   * \param type_definitions The global type definition map. Default empty.
+   * \param import_set Set of external modules already imported. Default empty.
    *
-   * \returns A module with expr set as the main function.
+   * \returns A module with \p expr set as the main function, and the global var to which
+   * \p expr was bound (typcially 'main').
+   *
+   * TODO(mbs): Does import_set and the bound global var need to be exposed via ffi?
+   */
+  static std::pair<IRModule, GlobalVar> FromExprInContext(
+      const RelayExpr& expr, const Map<GlobalVar, BaseFunc>& global_funcs = {},
+      const Map<GlobalTypeVar, TypeData>& type_definitions = {},
+      std::unordered_set<String> import_set = {});
+
+  /*!
+   * \brief As for \p FromExprInContext, but assuming \p expr is bound to 'main' and no
+   * imports.
    */
   TVM_DLL static IRModule FromExpr(const RelayExpr& expr,
                                    const Map<GlobalVar, BaseFunc>& global_funcs = {},
@@ -330,6 +420,13 @@ class IRModule : public ObjectRef {
    */
   TVM_DLL static IRModule FromText(const String& text, const String& source_path);
 
+  /*!
+   * \brief Create a shallow copy of an IRModule.
+   * \param mod The module to copy.
+   * \return The copied module.
+   */
+  IRModule ShallowCopyIRModule(IRModule mod);
+
   /*! \brief Declare the container type. */
   using ContainerType = IRModuleNode;
 
@@ -340,32 +437,111 @@ class IRModule : public ObjectRef {
   TVM_DEFINE_OBJECT_REF_COW_METHOD(IRModuleNode);
 };
 
-/*!
- * \brief Pretty print a node for debug purposes.
- *
- * \param node The node to be printed.
- * \return The text reperesentation.
- * \note This function does not show version or meta-data.
- *       Use AsText if you want to store the text.
- * \sa AsText.
- */
-TVM_DLL String PrettyPrint(const ObjectRef& node);
+namespace attr {
+
+// Following are attributes for IRModule only.
 
 /*!
- * \brief Render the node as a string in the text format.
+ * \brief Name of the module
  *
- * \param node The node to be rendered.
- * \param show_meta_data Whether to print meta data section.
- * \param annotate An optional callback function for attaching
- *        additional comment block to an expr.
+ * Type: String
  *
- * \note We support a limited set of IR nodes that are part of
- *       relay IR and
- *
- * \sa PrettyPrint.
- * \return The text representation.
+ * \sa tvm::runtime::String
  */
-TVM_DLL String AsText(const ObjectRef& node, bool show_meta_data = true,
-                      runtime::TypedPackedFunc<String(ObjectRef)> annotate = nullptr);
+constexpr const char* kModuleName = "mod_name";
+
+/*!
+ * \brief Executor targeted by the module
+ *
+ * Type: Executor
+ *
+ * \sa tvm::relay::Executor
+ */
+constexpr const char* kExecutor = "executor";
+
+/*!
+ * \brief Runtime target of the module
+ *
+ * Type: Runtime
+ *
+ * \sa tvm::relay::Runtime
+ */
+constexpr const char* kRuntime = "runtime";
+
+/*!
+ * \brief workspace memory pools of the module
+ *
+ * Type: WorkspaceMemoryPools
+ *
+ * \sa tvm::WorkspaceMemoryPools
+ */
+constexpr const char* kWorkspaceMemoryPools = "workspace_memory_pools";
+
+/*!
+ * \brief constant memory pools of the module
+ *
+ * Type: ConstantMemoryPools
+ *
+ * \sa tvm::ConstantMemoryPools
+ */
+constexpr const char* kConstantMemoryPools = "constant_memory_pools";
+
+/*
+ * \brief All the runtime::NDArrays extracted from PrimFunc tir::AllocateConst nodes. The
+ * node will record the index into this array. See also kConstNameToConstant below, which is
+ * the analog for Realy Functions.
+ *
+ * Type: Array<runtime::NDArray>
+ */
+constexpr const char* kConstants = "constants";
+
+/*!
+ * \brief All the runtime::Modules accumulated during compilation by external codegen. These
+ * modules must be either directly linked or captured in the final compilation artifact.
+ *
+ * Type: Array<runtime::Module>
+ */
+constexpr const char* kExternalMods = "external_mods";
+
+/*!
+ * \brief A prefix for generating C symbols  system lib creation.
+ *
+ * This prefix guides passes that creates global_symbol for internal functions
+ * that may have c linkage (e.g. TIR functions and some BYOC functions). It also affects
+ * the symbol of the fat bin blob during module export.
+ *
+ * This attribute is used to avoid symbol conflict when we
+ * generate and combine multiple system libs that get linked into one.
+ *
+ * Rationale: mechanisms like BYOC rely on the common global symbol
+ * and each external compiler also has its own mechanism of mangling.
+ * As a result, we cannot rely on other mechanisms on setting a global_symbol and then renaming,
+ * because the external compiler already agreed on the name.
+ *
+ * system_lib_prefix provides a way to hint at the passes to allow names to
+ * avoid name conflict at the beginning.
+ *
+ * Note that users can still directly specify global symbols that may conflict.
+ * It is up to the downstream toolchain to manage those external-facing functions.
+ *
+ * This does not affect non-C linkage functions it is less of an issue because
+ * they will be embedded into fatbin that in different symbols,
+ * The system lib loader can pick the right prefix for a given prefix.
+ *
+ * Having this attribute implies system lib generation linkage.
+ */
+constexpr const char* kSystemLibPrefix = "system_lib_prefix";
+
+/*!
+ * \brief All the named runtime::NDArrays accumulated during compilation by external codegen.
+ * Generally the associated runtime::Module will indicate it requires bindings for these names,
+ * and during module initialization these bindings will be recovered from a ConstLoaderModule.
+ * See also kConstantsArray above, which is the analog for PrimFuncs.
+ *
+ * Type: Map<String, runtime::NDArray>
+ */
+constexpr const char* kConstNameToConstant = "const_name_to_constant";
+
+}  // namespace attr
 }  // namespace tvm
 #endif  // TVM_IR_MODULE_H_

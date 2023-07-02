@@ -39,7 +39,7 @@ def _tensorlist_reserve():
     def _impl(inputs, attr, params, prelude):
         dtype_str = attr.get("element_dtype").name
         elem_shape = _infer_value(inputs[0], params, prelude.mod)
-        elem_shape = tuple(elem_shape.asnumpy().astype("int32").flatten())
+        elem_shape = tuple(elem_shape.numpy().astype("int32").flatten())
 
         if elem_shape or "shape" in attr:
             shape = attr["shape"] if "shape" in attr else elem_shape
@@ -64,7 +64,7 @@ def _tensorlist_set_item():
         input_rank = len(input_t_shape)
 
         if input_ta_shape is None:
-            tensor_name = "tensor{}".format(input_rank)
+            tensor_name = f"tensor{input_rank}"
             tensor_func = prelude.get_tensor_ctor(tensor_name, dtype_str)
             v = tensor_func(inputs[2])
             write_func = prelude.get_global_var("tensor_array_write", dtype_str)

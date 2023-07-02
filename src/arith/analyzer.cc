@@ -25,6 +25,8 @@
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
 
+#include "product_normal_form.h"
+
 namespace tvm {
 namespace arith {
 
@@ -44,6 +46,8 @@ void Analyzer::Bind(const Var& var, const PrimExpr& expr, bool allow_override) {
   this->modular_set.Update(var, this->modular_set(new_expr), allow_override);
   this->rewrite_simplify.Update(var, new_expr, allow_override);
   this->canonical_simplify.Update(var, new_expr, allow_override);
+  this->int_set.Update(var, this->int_set(new_expr), allow_override);
+  this->transitive_comparisons.Bind(var, expr, allow_override);
 }
 
 void Analyzer::Bind(const Var& var, const Range& range, bool allow_override) {
@@ -52,6 +56,8 @@ void Analyzer::Bind(const Var& var, const Range& range, bool allow_override) {
     this->Bind(var, range->min, allow_override);
   } else {
     this->const_int_bound.Bind(var, range, allow_override);
+    this->int_set.Bind(var, range, allow_override);
+    this->transitive_comparisons.Bind(var, range, allow_override);
   }
   // skip modular_set
   // skip rewrite simplify
@@ -64,22 +70,23 @@ void Analyzer::Bind(const Map<Var, Range>& variables, bool allow_override) {
 }
 
 void ConstraintContext::EnterWithScope() {
-  ICHECK(exit_ == nullptr);
+  ICHECK(recovery_functions_.size() == 0);
   // entering the scope.
-  auto f0 = analyzer_->const_int_bound.EnterConstraint(constraint_);
-  auto f1 = analyzer_->modular_set.EnterConstraint(constraint_);
-  auto f2 = analyzer_->rewrite_simplify.EnterConstraint(constraint_);
-  // recovery function.
-  exit_ = [f0, f1, f2]() {
-    if (f2 != nullptr) f2();
-    if (f1 != nullptr) f1();
-    if (f0 != nullptr) f0();
-  };
+  recovery_functions_.push_back(analyzer_->const_int_bound.EnterConstraint(constraint_));
+  recovery_functions_.push_back(analyzer_->modular_set.EnterConstraint(constraint_));
+  recovery_functions_.push_back(analyzer_->rewrite_simplify.EnterConstraint(constraint_));
+  recovery_functions_.push_back(analyzer_->int_set.EnterConstraint(constraint_));
+  recovery_functions_.push_back(analyzer_->transitive_comparisons.EnterConstraint(constraint_));
 }
 
 void ConstraintContext::ExitWithScope() {
-  ICHECK(exit_ != nullptr);
-  exit_();
+  while (recovery_functions_.size()) {
+    auto& func = recovery_functions_.back();
+    if (func) {
+      func();
+    }
+    recovery_functions_.pop_back();
+  }
 }
 
 bool Analyzer::CanProveGreaterEqual(const PrimExpr& expr, int64_t lower_bound) {
@@ -104,33 +111,92 @@ bool Analyzer::CanProveEqual(const PrimExpr& lhs, const PrimExpr& rhs) {
   const auto* clhs = lhs.as<IntImmNode>();
   const auto* crhs = rhs.as<IntImmNode>();
   if (clhs && crhs) return clhs->value == crhs->value;
+  if (lhs->dtype.is_handle() || rhs->dtype.is_handle()) {
+    return lhs.same_as(rhs);
+  }
   return CanProve(lhs - rhs == 0);
 }
 
-bool Analyzer::CanProve(const PrimExpr& expr) {
+bool Analyzer::CanProveLessEqualThanSymbolicShapeValue(const PrimExpr& lhs, const PrimExpr& shape) {
+  if (this->CanProve(lhs <= shape, ProofStrength::kSymbolicBound)) return true;
+  // no need to do further attempt if shape is already a constant.
+  if (tir::is_const_int(shape)) return false;
+  // collect constant scale and ignore symbolic part
+  // so 32 * n => cscale = 32
+  int64_t cscale = 1;
+  auto fcollect = [&](const PrimExpr& expr) {
+    if (auto* ptr = expr.as<IntImmNode>()) {
+      cscale *= ptr->value;
+    }
+  };
+  UnpackReduction<tir::MulNode>(shape, fcollect);
+  PrimExpr const_shape_bound = IntImm(shape.dtype(), std::abs(cscale));
+  if (this->CanProve(lhs <= const_shape_bound, ProofStrength::kSymbolicBound)) return true;
+  return false;
+}
+
+bool Analyzer::CanProve(const PrimExpr& expr, ProofStrength strength) {
+  // Avoid potentially expensive simplification unless required.
   if (const auto* ptr = expr.as<IntImmNode>()) {
     return ptr->value != 0;
   }
-  auto res = this->rewrite_simplify(expr);
-  if (const auto* ptr = res.as<IntImmNode>()) {
-    return ptr->value != 0;
+  PrimExpr simplified = Simplify(expr);
+  const int64_t* as_int = tir::as_const_int(simplified);
+  if (as_int && *as_int) return true;
+  if (strength >= ProofStrength::kSymbolicBound) {
+    // NOTE: we intentionally only pattern match common bound predicate i < bound
+    // and put this implementation at the top-level.
+    // This is to avoid repeatitive calling of this function
+    // that causes speed issues.
+    // This strategy can only be called from top-level and not from sub-analyzers.
+    Optional<PrimExpr> pos_diff;
+    int lower_bound = 0;
+    if (const auto* ptr_lt = expr.as<tir::LTNode>()) {
+      pos_diff = ptr_lt->b - ptr_lt->a;
+      lower_bound = 1;
+    }
+    if (const auto* ptr_le = expr.as<tir::LENode>()) {
+      pos_diff = ptr_le->b - ptr_le->a;
+      lower_bound = 0;
+    }
+    if (const auto* ptr_gt = expr.as<tir::GTNode>()) {
+      pos_diff = ptr_gt->a - ptr_gt->b;
+      lower_bound = 1;
+    }
+    if (const auto* ptr_ge = expr.as<tir::GENode>()) {
+      pos_diff = ptr_ge->a - ptr_ge->b;
+      lower_bound = 0;
+    }
+    if (pos_diff) {
+      IntSet iset = this->int_set(this->Simplify(pos_diff.value()));
+      if (iset.HasLowerBound()) {
+        ConstIntBound relaxed_lower_bound = this->const_int_bound(this->Simplify(iset.min()));
+        if (relaxed_lower_bound->min_value >= lower_bound) return true;
+      }
+    }
   }
-  res = this->canonical_simplify(expr);
-  if (const auto* ptr = res.as<IntImmNode>()) {
-    return ptr->value != 0;
-  }
+
   return false;
 }
 
 PrimExpr Analyzer::Simplify(const PrimExpr& expr, int steps) {
-  if (tir::is_const_int(expr)) return expr;
   PrimExpr res = expr;
+
+  // Always starts with a canonical simplification, as some structural property
+  // of an expression might be destroyed by rewrite simplification.
+  res = this->canonical_simplify(res);
+
   for (int i = 0; i < steps; ++i) {
-    res = this->rewrite_simplify(res);
-    if (tir::is_const_int(res) || ++i == steps) return res;
-    res = this->canonical_simplify(res);
-    if (tir::is_const_int(res)) return res;
+    if (tir::is_const_int(res)) {
+      return res;
+    }
+    if (i % 2 == 0) {
+      res = this->rewrite_simplify(res);
+    } else {
+      res = this->canonical_simplify(res);
+    }
   }
+
   return res;
 }
 
@@ -162,6 +228,13 @@ TVM_REGISTER_GLOBAL("arith.CreateAnalyzer").set_body([](TVMArgs args, TVMRetValu
     } else if (name == "rewrite_simplify") {
       return PackedFunc(
           [self](TVMArgs args, TVMRetValue* ret) { *ret = self->rewrite_simplify(args[0]); });
+    } else if (name == "get_rewrite_simplify_stats") {
+      return PackedFunc([self](TVMArgs args, TVMRetValue* ret) {
+        *ret = self->rewrite_simplify.GetStatsCounters();
+      });
+    } else if (name == "reset_rewrite_simplify_stats") {
+      return PackedFunc(
+          [self](TVMArgs args, TVMRetValue* ret) { self->rewrite_simplify.ResetStatsCounters(); });
     } else if (name == "canonical_simplify") {
       return PackedFunc(
           [self](TVMArgs args, TVMRetValue* ret) { *ret = self->canonical_simplify(args[0]); });
@@ -176,15 +249,23 @@ TVM_REGISTER_GLOBAL("arith.CreateAnalyzer").set_body([](TVMArgs args, TVMRetValu
           self->Bind(args[0], args[1].operator PrimExpr());
         }
       });
+    } else if (name == "can_prove") {
+      return PackedFunc([self](TVMArgs args, TVMRetValue* ret) {
+        int strength = args[1];
+        *ret = self->CanProve(args[0], static_cast<ProofStrength>(strength));
+      });
     } else if (name == "enter_constraint_context") {
       return PackedFunc([self](TVMArgs args, TVMRetValue* ret) {
         // can't use make_shared due to noexcept(false) decl in destructor,
         // see https://stackoverflow.com/a/43907314
-        auto ctx = std::shared_ptr<With<ConstraintContext> >(
+        auto ctx = std::shared_ptr<With<ConstraintContext>>(
             new With<ConstraintContext>(self.get(), args[0]));
         auto fexit = [ctx](TVMArgs, TVMRetValue*) mutable { ctx.reset(); };
         *ret = PackedFunc(fexit);
       });
+    } else if (name == "can_prove_equal") {
+      return PackedFunc(
+          [self](TVMArgs args, TVMRetValue* ret) { *ret = self->CanProveEqual(args[0], args[1]); });
     }
     return PackedFunc();
   };

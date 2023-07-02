@@ -17,14 +17,22 @@
 
 """Defines a top-level glue class that operates the Transport and Flasher classes."""
 
+import json
 import logging
 import sys
+import os
+import pathlib
+import shutil
+from typing import Union
 
+from tvm.runtime.executor.aot_executor import AotModule
 from ..error import register_error
-from .._ffi import get_global_func
+from .._ffi import get_global_func, register_func
 from ..contrib import graph_executor
+from ..contrib import utils
 from ..contrib.debugger import debug_executor
 from ..rpc import RPCSession
+from . import project
 from .transport import IoTimeoutError
 from .transport import TransportLogger
 
@@ -36,7 +44,7 @@ except ImportError:
 
 @register_error
 class SessionTerminatedError(Exception):
-    """Raised when a transport read operationd discovers that the remote session is terminated."""
+    """Raised when a transport read operation discovers that the remote session is terminated."""
 
 
 class Session:
@@ -60,8 +68,6 @@ class Session:
 
     def __init__(
         self,
-        binary=None,
-        flasher=None,
         transport_context_manager=None,
         session_name="micro-rpc",
         timeout_override=None,
@@ -70,32 +76,32 @@ class Session:
 
         Parameters
         ----------
-        binary : MicroBinary
-            If given, `flasher` must also be given. During session initialization, this binary will
-            be flashed to the device before the transport is created.
-        flasher : Flasher
-            If given, `binary` must also be given. Used to flash `binary` during session
-            initialization.
         transport_context_manager : ContextManager[transport.Transport]
             If given, `flasher` and `binary` should not be given. On entry, this context manager
-            should establish a tarnsport between this TVM instance and the device.
+            should establish a transport between this TVM instance and the device.
         session_name : str
             Name of the session, used for debugging.
         timeout_override : TransportTimeouts
             If given, TransportTimeouts that govern the way Receive() behaves. If not given, this is
             determined by calling has_flow_control() on the transport.
         """
-        self.binary = binary
-        self.flasher = flasher
         self.transport_context_manager = transport_context_manager
         self.session_name = session_name
         self.timeout_override = timeout_override
 
         self._rpc = None
         self._graph_executor = None
+        self._enable_rpc_logger = False
+
+        self._exit_called = False
 
     def get_system_lib(self):
         return self._rpc.get_function("runtime.SystemLib")()
+
+    def create_aot_executor(self):
+        return self._rpc.get_function("tvm.aot_executor.create")(
+            self.get_system_lib(), self.device, "default"
+        )
 
     def _wrap_transport_read(self, n, timeout_microsec):
         try:
@@ -106,12 +112,11 @@ class Session:
             return bytes([])
 
     def _wrap_transport_write(self, data, timeout_microsec):
-        try:
-            return self.transport.write(
-                data, float(timeout_microsec) / 1e6 if timeout_microsec is not None else None
-            )
-        except IoTimeoutError:
-            return 0
+        self.transport.write(
+            data, float(timeout_microsec) / 1e6 if timeout_microsec is not None else None
+        )
+
+        return len(data)  # TODO(areusch): delete
 
     def __enter__(self):
         """Initialize this session and establish an RPC session with the on-device RPC server.
@@ -121,9 +126,6 @@ class Session:
         Session :
             Returns self.
         """
-        if self.flasher is not None:
-            self.transport_context_manager = self.flasher.flash(self.binary)
-
         self.transport = TransportLogger(
             self.session_name, self.transport_context_manager, level=logging.DEBUG
         ).__enter__()
@@ -141,6 +143,8 @@ class Session:
                     int(timeouts.session_start_retry_timeout_sec * 1e6),
                     int(timeouts.session_start_timeout_sec * 1e6),
                     int(timeouts.session_established_timeout_sec * 1e6),
+                    self._cleanup,
+                    self._enable_rpc_logger,
                 )
             )
             self.device = self._rpc.cpu(0)
@@ -152,7 +156,14 @@ class Session:
 
     def __exit__(self, exc_type, exc_value, exc_traceback):
         """Tear down this session and associated RPC session resources."""
-        self.transport.__exit__(exc_type, exc_value, exc_traceback)
+        if not self._exit_called:
+            self._exit_called = True
+            self.transport.__exit__(exc_type, exc_value, exc_traceback)
+            shutdown_func = self._rpc._sess.get_function("CloseRPCConnection")
+            shutdown_func()
+
+    def _cleanup(self):
+        self.__exit__(None, None, None)
 
 
 def lookup_remote_linked_param(mod, storage_id, template_tensor, device):
@@ -248,3 +259,91 @@ def create_local_debug_executor(graph_json_str, mod, device, dump_root=None):
         graph_json_str,
         dump_root=dump_root,
     )
+
+
+def create_local_aot_executor(session: Session):
+    """Create a local AoT executor driving execution on the remote CPU device given.
+
+    Parameters
+    ----------
+    session : Session
+        A microTVM device session.
+
+    Returns
+    -------
+    tvm.runtime.executor.aot_executor.AotModule :
+         A local AoT executor instance that executes on the remote device.
+    """
+    return AotModule(session.create_aot_executor())
+
+
+@register_func("tvm.micro.compile_and_create_micro_session")
+def compile_and_create_micro_session(
+    mod_src_bytes: bytes,
+    template_project_dir: str,
+    project_options: dict = None,
+    project_dir: Union[os.PathLike, str] = None,
+    use_existing: bool = False,
+):
+    """Compile the given libraries and sources into a MicroBinary, then invoke create_micro_session.
+
+    Parameters
+    ----------
+    mod_src_bytes : bytes
+        The content of a tarfile which contains the TVM-generated sources which together form the
+        SystemLib. This tar is expected to be created by export_library. The tar will be extracted
+        into a directory and the sources compiled into a MicroLibrary using the Compiler.
+
+    template_project_dir: str
+        The path to a template microTVM Project API project which is used to generate the embedded
+        project that is built and flashed onto the target device.
+
+    project_options: dict
+        Options for the microTVM API Server contained in template_project_dir.
+
+    project_dir: Union[os.PathLike, str]
+        if use_existing is False: The path to save the generated microTVM Project.
+        if use_existing is True: The path to a generated microTVM Project for debugging.
+
+    use_existing: bool
+        skips the project generation and opens transport to the project at the project_dir address.
+    """
+
+    if use_existing:
+        project_dir = pathlib.Path(project_dir)
+        assert project_dir.is_dir(), f"{project_dir} does not exist."
+        build_dir = project_dir / "generated-project" / "build"
+        shutil.rmtree(build_dir)
+        generated_project = project.GeneratedProject.from_directory(
+            project_dir / "generated-project",
+            options=json.loads(project_options),
+        )
+    else:
+        if project_dir:
+            temp_dir = utils.tempdir(custom_path=project_dir, keep_for_debug=True)
+        else:
+            temp_dir = utils.tempdir()
+
+        model_library_format_path = temp_dir / "model.tar.gz"
+        with open(model_library_format_path, "wb") as mlf_f:
+            mlf_f.write(mod_src_bytes)
+
+        try:
+            template_project = project.TemplateProject.from_directory(template_project_dir)
+            generated_project = template_project.generate_project_from_mlf(
+                model_library_format_path,
+                str(temp_dir / "generated-project"),
+                options=json.loads(project_options),
+            )
+        except Exception as exception:
+            logging.error("Project Generate Error: %s", str(exception))
+            raise exception
+
+    generated_project.build()
+    generated_project.flash()
+    transport = generated_project.transport()
+
+    rpc_session = Session(transport_context_manager=transport)
+    # RPC exit is called by cleanup function.
+    rpc_session.__enter__()
+    return rpc_session._rpc._sess

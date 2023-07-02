@@ -221,9 +221,9 @@ def assert_equal(tvm_result, torch_result):
 
 
 def run_and_compare(mod, params, pt_result, target, device):
-    executor = relay.create_executor("vm", mod=mod, device=device, target=target)
-    evaluator = executor.evaluate()
-    exec_res = evaluator(**params)
+    exec_res = relay.create_executor("vm", mod=mod, device=device, target=target).evaluate()(
+        **params
+    )
 
     def flatten(nested):
         res = []
@@ -337,7 +337,11 @@ def test_custom_lstm():
 
     for (name, raw_model, states, input_shapes) in models:
         script_module = torch.jit.script(raw_model)
-        mod, params = from_pytorch(script_module, input_shapes)
+        with tvm.testing.disable_span_filling():
+            mod, params = from_pytorch(script_module, input_shapes)
+        with tvm.testing.enable_span_filling():
+            mod_with_span, _ = from_pytorch(script_module, input_shapes)
+        assert tvm.ir.structural_equal(mod, mod_with_span, map_free_vars=True)
 
         with torch.no_grad():
             pt_result = raw_model(inp.clone(), states)

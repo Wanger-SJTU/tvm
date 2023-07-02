@@ -15,37 +15,24 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import tvm
-from tvm import rpc, relay
-from tvm.contrib.download import download_testdata
-from tvm.relay.expr_functor import ExprMutator
-from tvm.relay import transform
-from tvm.relay.op.annotation import compiler_begin, compiler_end
-from tvm.relay.quantize.quantize import prerequisite_optimize
-from tvm.contrib import utils, xcode, graph_executor, coreml_runtime
-from tvm.contrib.target import coreml as _coreml
-
+import argparse
 import os
 import re
 import sys
+
+import coremltools
 import numpy as np
+import tvm
 from mxnet import gluon
 from PIL import Image
-import coremltools
-
-# Set to be address of tvm proxy.
-proxy_host = os.environ["TVM_IOS_RPC_PROXY_HOST"]
-# Set your desination via env variable.
-# Should in format "platform=iOS,id=<the test device uuid>"
-destination = os.environ["TVM_IOS_RPC_DESTINATION"]
-
-if not re.match(r"^platform=.*,id=.*$", destination):
-    print("Bad format: {}".format(destination))
-    print("Example of expected string: platform=iOS,id=1234567890abcabcabcabc1234567890abcabcab")
-    sys.exit(1)
-
-proxy_port = 9090
-key = "iphone"
+from tvm import relay, rpc
+from tvm.contrib import coreml_runtime, graph_executor, utils, xcode
+from tvm.contrib.download import download_testdata
+from tvm.contrib.target import coreml as _coreml
+from tvm.relay import transform
+from tvm.relay.expr_functor import ExprMutator
+from tvm.relay.op.annotation import compiler_begin, compiler_end
+from tvm.relay.quantize.quantize import prerequisite_optimize
 
 # Change target configuration, this is setting for iphone6s
 # arch = "x86_64"
@@ -54,9 +41,12 @@ arch = "arm64"
 sdk = "iphoneos"
 target_host = "llvm -mtriple=%s-apple-darwin" % arch
 
+MODES = {"proxy": rpc.connect, "tracker": rpc.connect_tracker, "standalone": rpc.connect}
+
+
 # override metal compiler to compile to iphone
 @tvm.register_func("tvm_callback_metal_compile")
-def compile_metal(src):
+def compile_metal(src, target):
     return xcode.compile_metal(src, sdk=sdk)
 
 
@@ -97,23 +87,25 @@ def get_model(model_name, data_shape):
     return func, params
 
 
-def test_mobilenet():
+def test_mobilenet(host, port, key, mode):
     temp = utils.tempdir()
     image, synset = prepare_input()
     model, params = get_model("mobilenetv2_1.0", image.shape)
 
     def run(mod, target):
         with relay.build_config(opt_level=3):
-            lib = relay.build(mod, target=target, target_host=target_host, params=params)
+            lib = relay.build(
+                mod, target=tvm.target.Target(target, host=target_host), params=params
+            )
         path_dso = temp.relpath("deploy.dylib")
         lib.export_library(path_dso, xcode.create_dylib, arch=arch, sdk=sdk)
-        xcode.codesign(path_dso)
-
-        # Start RPC test server that contains the compiled library.
-        xcode.popen_test_rpc(proxy_host, proxy_port, key, destination=destination, libs=[path_dso])
 
         # connect to the proxy
-        remote = rpc.connect(proxy_host, proxy_port, key=key)
+        if mode == "tracker":
+            remote = MODES[mode](host, port).request(key)
+        else:
+            remote = MODES[mode](host, port, key=key)
+        remote.upload(path_dso)
 
         if target == "metal":
             dev = remote.metal(0)
@@ -175,4 +167,19 @@ def test_mobilenet():
 
 
 if __name__ == "__main__":
-    test_mobilenet()
+    parser = argparse.ArgumentParser(description="Demo app demonstrates how ios_rpc works.")
+    parser.add_argument("--host", required=True, type=str, help="Adress of rpc server")
+    parser.add_argument("--port", type=int, default=9090, help="rpc port (default: 9090)")
+    parser.add_argument("--key", type=str, default="iphone", help="device key (default: iphone)")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="tracker",
+        help="type of RPC connection (default: tracker), possible values: {}".format(
+            ", ".join(MODES.keys())
+        ),
+    )
+
+    args = parser.parse_args()
+    assert args.mode in MODES.keys()
+    test_mobilenet(args.host, args.port, args.key, args.mode)

@@ -28,7 +28,7 @@ from tvm import topi
 import tvm
 from tvm import te
 from tvm import rpc, autotvm, relay
-from tvm.contrib import graph_runtime, download
+from tvm.contrib import download
 from tvm.autotvm.measure.measure_methods import request_remote
 from tvm.autotvm.tuner import XGBTuner, GATuner, RandomTuner, GridSearchTuner
 from tvm.autotvm import record
@@ -179,10 +179,30 @@ def tune_tasks(
         prefix = "[Task %2d/%2d] " % (i + 1, len(tasks))
 
         # create tuner
-        if tuner == "xgb" or tuner == "xgb-rank":
-            tuner_obj = XGBTuner(tsk, loss_type="rank")
+        if tuner == "xgb":
+            tuner_obj = XGBTuner(tsk, loss_type="reg")
         elif tuner == "xgb_knob":
+            tuner_obj = XGBTuner(tsk, loss_type="reg", feature_type="knob")
+        elif tuner == "xgb_itervar":
+            tuner_obj = XGBTuner(tsk, loss_type="reg", feature_type="itervar")
+        elif tuner == "xgb_curve":
+            tuner_obj = XGBTuner(tsk, loss_type="reg", feature_type="curve")
+        elif tuner == "xgb_rank":
+            tuner_obj = XGBTuner(tsk, loss_type="rank")
+        elif tuner == "xgb_rank_knob":
             tuner_obj = XGBTuner(tsk, loss_type="rank", feature_type="knob")
+        elif tuner == "xgb_rank_itervar":
+            tuner_obj = XGBTuner(tsk, loss_type="rank", feature_type="itervar")
+        elif tuner == "xgb_rank_curve":
+            tuner_obj = XGBTuner(tsk, loss_type="rank", feature_type="curve")
+        elif tuner == "xgb_rank_binary":
+            tuner_obj = XGBTuner(tsk, loss_type="rank-binary")
+        elif tuner == "xgb_rank_binary_knob":
+            tuner_obj = XGBTuner(tsk, loss_type="rank-binary", feature_type="knob")
+        elif tuner == "xgb_rank_binary_itervar":
+            tuner_obj = XGBTuner(tsk, loss_type="rank-binary", feature_type="itervar")
+        elif tuner == "xgb_rank_binary_curve":
+            tuner_obj = XGBTuner(tsk, loss_type="rank-binary", feature_type="curve")
         elif tuner == "ga":
             tuner_obj = GATuner(tsk, pop_size=50)
         elif tuner == "random":
@@ -285,8 +305,7 @@ def tune_and_evaluate(tuning_opt):
             relay.op.get("add"),
             relay.op.get("multiply"),
         ),
-        target=target,
-        target_host=env.target_host,
+        target=tvm.target.Target(target, host=env.target_host),
     )
 
     # filter out non-packed alu task

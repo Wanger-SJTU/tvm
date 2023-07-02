@@ -17,6 +17,7 @@
 # pylint: disable=wildcard-import
 """Schedule for ARM CPU"""
 
+from .conv1d import *
 from .conv2d import *
 from .depthwise_conv2d import *
 from .conv2d_transpose import *
@@ -25,5 +26,9 @@ from . import conv2d_alter_op
 from .bitserial_conv2d import *
 from .bitserial_dense import *
 from .injective import *
-from . import cortex_m7
 from .group_conv2d import *
+from .pooling import *
+from .dense import *
+from .qnn import *
+from . import qnn_alter_op
+from . import qnn_legalize

@@ -21,6 +21,7 @@ import tvm
 from tvm import te, arith, ir, tir, testing
 
 
+@pytest.mark.skip(reason="See https://github.com/apache/tvm/issues/11458")
 def test_solution_consistency():
     seed = random.randrange(sys.maxsize)
     print(
@@ -195,5 +196,20 @@ def test_no_solution():
     assert not rel
 
 
+def test_unbound_var_range():
+    x = te.var("x0")
+    free_var = te.var("fv")
+    vranges = {x: tvm.ir.Range.from_min_extent(0, tvm.tir.Cast("int32", 1 + tvm.tir.log(free_var)))}
+    problem = [x > 3]
+    solution = arith.solve_linear_inequalities(
+        problem,
+        [x],
+        vranges,
+    )
+    assert len(solution.variables) == 1
+    assert len(solution.ranges) == 0
+    assert len(solution.relations) == 3
+
+
 if __name__ == "__main__":
-    pytest.main([__file__])
+    tvm.testing.main()

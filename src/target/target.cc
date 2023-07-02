@@ -21,6 +21,8 @@
  * \file src/target/target.cc
  */
 #include <dmlc/thread_local.h>
+#include <tvm/runtime/device_api.h>
+#include <tvm/runtime/logging.h>
 #include <tvm/runtime/registry.h>
 #include <tvm/target/tag.h>
 #include <tvm/target/target.h>
@@ -29,7 +31,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <ios>
+#include <sstream>
 #include <stack>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "../runtime/object_internal.h"
 
@@ -50,13 +58,27 @@ class TargetInternal {
   static ObjectPtr<Object> FromString(const String& tag_or_config_or_target_str);
   static ObjectPtr<Object> FromConfigString(const String& config_str);
   static ObjectPtr<Object> FromRawString(const String& target_str);
-  static ObjectPtr<Object> FromConfig(std::unordered_map<String, ObjectRef> config);
+  static ObjectPtr<Object> FromConfig(Map<String, ObjectRef> config);
   static void ConstructorDispatcher(TVMArgs args, TVMRetValue* rv);
   static Target WithHost(const Target& target, const Target& target_host) {
     ObjectPtr<TargetNode> n = make_object<TargetNode>(*target.get());
     n->host = target_host;
     return (Target)n;
   }
+
+ private:
+  static std::unordered_map<String, ObjectRef> QueryDevice(int device_id, const TargetNode* target);
+  static bool IsQuoted(const std::string& str);
+  static std::string Quote(const std::string& str);
+  static std::string JoinString(const std::vector<std::string>& array, char separator);
+  static std::vector<std::string> SplitString(const std::string& str, char separator);
+  static std::string Interpret(const std::string& str);
+  static std::string Uninterpret(const std::string& str);
+  static std::string StringifyAtomicType(const ObjectRef& obj);
+  static std::string StringifyArray(const ArrayNode& array);
+
+  static constexpr char quote = '\'';
+  static constexpr char escape = '\\';
 };
 
 /**********  Helper functions  **********/
@@ -67,16 +89,6 @@ Target Target::WithHost(const Target& target, const Target& host) {
 void CheckAndUpdateHostConsistency(Target* target, Target* host) {
   *target = Target(*target, *host);
   *host = (*target)->GetHost().value_or(Target());
-}
-
-void CheckAndUpdateHostConsistency(Map<Integer, Target>* targets, Target* host) {
-  Map<Integer, Target> new_targets;
-  for (auto& it : *targets) {
-    auto target = it.second;
-    CheckAndUpdateHostConsistency(&target, host);
-    new_targets.Set(it.first, target);
-  }
-  *targets = new_targets;
 }
 
 void CheckAndUpdateHostConsistency(Map<Target, IRModule>* targets, Target* host) {
@@ -140,29 +152,178 @@ static std::string RemovePrefixDashes(const std::string& s) {
   return s.substr(n_dashes);
 }
 
-static int FindFirstSubstr(const std::string& str, const std::string& substr) {
-  size_t pos = str.find_first_of(substr);
-  return pos == std::string::npos ? -1 : pos;
+bool TargetInternal::IsQuoted(const std::string& str) {
+  std::string::size_type start = 0, end = str.size();
+  if (end < 2 || str[start] != quote || str[end - 1] != quote) {
+    return false;
+  }
+  bool escaping = false;
+  for (auto i = start + 1, e = end - 1; i < e; ++i) {
+    if (escaping) {
+      escaping = false;
+    } else if (str[i] == escape) {
+      escaping = true;
+    } else if (str[i] == quote) {
+      return false;
+    }
+  }
+  // If the reduced string ends with \, then the terminating quote is escaped.
+  return !escaping;
 }
 
-static Optional<String> JoinString(const std::vector<String>& array, char separator) {
-  if (array.empty()) {
-    return NullOpt;
+std::string TargetInternal::Quote(const std::string& str) {
+  std::string result(1, quote);
+  result.append(str);
+  result.push_back(quote);
+  return result;
+}
+
+std::string TargetInternal::JoinString(const std::vector<std::string>& array, char separator) {
+  std::string result;
+  ICHECK(separator != quote && separator != escape)
+      << "string join separator cannot be " << quote << " or " << escape;
+
+  bool is_first = true;
+  for (const auto& s : array) {
+    if (!is_first) {
+      result.push_back(separator);
+    }
+    result.append(s);
+    is_first = false;
   }
-  std::ostringstream os;
-  os << array[0];
-  for (size_t i = 1; i < array.size(); ++i) {
-    os << separator << array[i];
+
+  return result;
+}
+
+std::vector<std::string> TargetInternal::SplitString(const std::string& str, char separator) {
+  std::vector<std::string> output;
+
+  const char* start = str.data();
+  const char* end = start + str.size();
+  const char* pos = start;
+
+  std::stringstream current_word;
+
+  auto finish_word = [&]() {
+    std::string word = current_word.str();
+    if (word.size()) {
+      output.push_back(word);
+      current_word.str("");
+    }
+  };
+
+  bool pos_quoted = false;
+
+  while (pos < end) {
+    if ((*pos == separator) && !pos_quoted) {
+      finish_word();
+      pos++;
+    } else if (*pos == escape && pos + 1 < end) {
+      current_word << escape;
+      current_word << pos[1];
+      pos += 2;
+    } else if (*pos == quote) {
+      current_word << quote;
+      pos_quoted = !pos_quoted;
+      pos++;
+    } else {
+      current_word << *pos;
+      pos++;
+    }
   }
-  return String(os.str());
+
+  ICHECK(!pos_quoted) << "Mismatched quotes '' in string";
+
+  finish_word();
+
+  return output;
+}
+
+std::string TargetInternal::Interpret(const std::string& str) {
+  // String interpretation deals with quotes (') and escapes(\).
+  // - An escape character must be followed by another character forming an
+  //   "escape sequence". (Trailing escape is not allowed.) An escape prevents
+  //   interpretation of the character that follows. This happens regardless of
+  //   whether the escape sequence appears within quoted substring or not.
+  // - A quote character, when interpreted, marks the beginning or the end of a
+  //   quoted substring. (A quoted substring cannot contain unescaped quotes.)
+  // - Any other character, when interpreted, represents itself.
+  //
+  // Interpretation happens in two steps:
+  // 1. If the entire string is quoted, the quotes are removed first, and the
+  //    resulting string is treated as unquoted.
+  // 2. Each character or escape sequence is interpreted, and the result is copied
+  //    to the result. When not inside a quoted substring, the interpretation of an
+  //    escape sequence is the escaped character, otherwise it is the entire escape
+  //    sequence.
+  //
+  // Examples:
+  //    blah                -> blah         Nothing happened
+  //    'blah'              -> blah         Enclosing quotes removed
+  //    'bl'ah              -> 'bl'ah       Non-enclosing quotes remain
+  //    '\'blah\''          -> 'blah'       Enclosing quotes removed, escaped quotes
+  //                                        interpreted.
+  //    '\'\\\'blah\\\'\''  -> '\'blah\''   Same as above.
+  //
+  // Note that
+  //    '\'\\\'blah\\\'\'' -> '\'blah\'' -> 'blah'
+
+  std::string result;
+  if (str.empty()) {
+    return result;
+  }
+
+  // Check if the entire string is enclosed in quotes ''. If so, strip the quotes
+  // and treat the string as unquoted (so that escapes are interpreted). Doing that
+  // will allow '\'foo\'' to become 'foo', instead of \'foo\'.
+  std::string::size_type start = 0, end = str.size();
+  if (IsQuoted(str)) {
+    start++;
+    end--;
+  }
+
+  bool inside_quote = false;
+  bool escaping = false;
+
+  for (auto i = start, e = end; i < e; ++i) {
+    std::string::value_type c = str[i];
+    if (escaping) {
+      escaping = false;
+    } else if (c == escape) {
+      escaping = true;
+      if (!inside_quote) {
+        continue;
+      }
+    } else if (c == quote) {
+      inside_quote = !inside_quote;
+    }
+    result.push_back(c);
+  }
+
+  return result;
+}
+
+std::string TargetInternal::Uninterpret(const std::string& str) {
+  // Do the opposite to `Interpret`, so that Interpret(Uninterpret(str)) == str.
+  std::string result;
+
+  for (std::string::size_type i = 0, e = str.size(); i < e; ++i) {
+    std::string::value_type c = str[i];
+    if (c == escape || c == quote) {
+      result.push_back(escape);
+    }
+    result.push_back(c);
+  }
+
+  return result;
 }
 
 static int ParseKVPair(const std::string& s, const std::string& s_next, std::string* key,
                        std::string* value) {
-  int pos;
+  std::string::size_type pos;
   std::string& result_k = *key;
   std::string& result_v = *value;
-  if ((pos = FindFirstSubstr(s, "=")) != -1) {
+  if ((pos = s.find_first_of('=')) != std::string::npos) {
     // case 1. --key=value
     result_k = s.substr(0, pos);
     result_v = s.substr(pos + 1);
@@ -206,13 +367,14 @@ const TargetKindNode::ValueTypeInfo& TargetInternal::FindTypeInfo(const TargetKi
 
 ObjectRef TargetInternal::ParseType(const std::string& str,
                                     const TargetKindNode::ValueTypeInfo& info) {
-  std::istringstream is(str);
+  std::string interp_str = Interpret(str);
   if (info.type_index == Integer::ContainerType::_GetOrAllocRuntimeTypeIndex()) {
     // Parsing integer
+    std::istringstream is(interp_str);
     int v;
     if (!(is >> v)) {
-      std::string lower(str.size(), '\x0');
-      std::transform(str.begin(), str.end(), lower.begin(),
+      std::string lower(interp_str.size(), '\x0');
+      std::transform(interp_str.begin(), interp_str.end(), lower.begin(),
                      [](unsigned char c) { return std::tolower(c); });
       // Bool is a subclass of IntImm, so allow textual boolean values.
       if (lower == "true") {
@@ -220,24 +382,27 @@ ObjectRef TargetInternal::ParseType(const std::string& str,
       } else if (lower == "false") {
         v = 0;
       } else {
-        throw Error(": Cannot parse into type \"Integer\" from string: " + str);
+        throw Error(": Cannot parse into type \"Integer\" from string: " + interp_str);
       }
     }
     return Integer(v);
   } else if (info.type_index == String::ContainerType::_GetOrAllocRuntimeTypeIndex()) {
-    // Parsing string
-    std::string v;
-    if (!(is >> v)) {
-      throw Error(": Cannot parse into type \"String\" from string: " + str);
+    // Parsing string, strip leading/trailing spaces, and enclosing quotes if any
+    auto start = interp_str.find_first_not_of(' ');
+    auto end = interp_str.find_last_not_of(' ');
+    if (start == std::string::npos || end == std::string::npos) {
+      // The whole string is made of spaces.
+      return String();
     }
-    return String(v);
+    return String(interp_str.substr(start, (end - start + 1)));
+
   } else if (info.type_index == Target::ContainerType::_GetOrAllocRuntimeTypeIndex()) {
     // Parsing target
-    return Target(TargetInternal::FromString(str));
+    return Target(TargetInternal::FromString(interp_str));
   } else if (info.type_index == ArrayNode::_GetOrAllocRuntimeTypeIndex()) {
     // Parsing array
     std::vector<ObjectRef> result;
-    for (std::string substr; std::getline(is, substr, ',');) {
+    for (const std::string& substr : SplitString(interp_str, ',')) {
       try {
         ObjectRef parsed = TargetInternal::ParseType(substr, *info.key);
         result.push_back(parsed);
@@ -248,7 +413,8 @@ ObjectRef TargetInternal::ParseType(const std::string& str,
     }
     return Array<ObjectRef>(result);
   }
-  throw Error(": Unsupported type \"" + info.type_key + "\" for parsing from string: " + str);
+  throw Error(": Unsupported type \"" + info.type_key +
+              "\" for parsing from string: " + interp_str);
 }
 
 ObjectRef TargetInternal::ParseType(const ObjectRef& obj,
@@ -261,10 +427,10 @@ ObjectRef TargetInternal::ParseType(const ObjectRef& obj,
     return GetRef<String>(ObjTypeCheck<StringObj>(obj, "String"));
   } else if (info.type_index == Target::ContainerType::_GetOrAllocRuntimeTypeIndex()) {
     // Parsing target
-    if (const auto* ptr = obj.as<TargetNode>()) {
-      return GetRef<Target>(ptr);
-    } else if (const auto* ptr = obj.as<StringObj>()) {
-      return Target(TargetInternal::FromString(GetRef<String>(ptr)));
+    if (auto opt = obj.as<Target>()) {
+      return opt.value();
+    } else if (auto str = obj.as<String>()) {
+      return Target(TargetInternal::FromString(str.value()));
     } else if (const auto* ptr = obj.as<MapNode>()) {
       for (const auto& kv : *ptr) {
         if (!kv.first->IsInstance<StringObj>()) {
@@ -325,14 +491,34 @@ ObjectRef TargetInternal::ParseType(const ObjectRef& obj,
 
 /**********  Stringifying  **********/
 
-static inline Optional<String> StringifyAtomicType(const ObjectRef& obj) {
+std::string TargetInternal::StringifyAtomicType(const ObjectRef& obj) {
   if (const auto* p = obj.as<IntImmNode>()) {
-    return String(std::to_string(p->value));
+    return std::to_string(p->value);
   }
-  if (const auto* p = obj.as<StringObj>()) {
-    return GetRef<String>(p);
+  if (auto tvm_str = obj.as<String>()) {
+    std::string s = tvm_str.value();
+    auto u = Uninterpret(s);
+    if (u.find_first_of(' ') != std::string::npos && !IsQuoted(u)) {
+      u = Quote(u);
+    }
+    return u;
   }
-  return NullOpt;
+  LOG(FATAL) << "Cannot stringify this object";
+}
+
+std::string TargetInternal::StringifyArray(const ArrayNode& array) {
+  std::vector<std::string> elements;
+
+  for (const ObjectRef& item : array) {
+    std::string s = StringifyAtomicType(item);
+    std::string u = Uninterpret(s);
+    if (u.find_first_of(',') != std::string::npos && !IsQuoted(u)) {
+      u = Quote(u);
+    }
+    elements.push_back(u);
+  }
+
+  return JoinString(elements, ',');
 }
 
 Optional<String> TargetInternal::StringifyAttrsToRaw(const Map<String, ObjectRef>& attrs) {
@@ -342,30 +528,21 @@ Optional<String> TargetInternal::StringifyAttrsToRaw(const Map<String, ObjectRef
     keys.push_back(kv.first);
   }
   std::sort(keys.begin(), keys.end());
-  std::vector<String> result;
+  std::vector<std::string> result;
+
   for (const auto& key : keys) {
     const ObjectRef& obj = attrs[key];
-    Optional<String> value = NullOpt;
+    std::string value;
     if (const auto* array = obj.as<ArrayNode>()) {
-      std::vector<String> items;
-      for (const ObjectRef& item : *array) {
-        Optional<String> str = StringifyAtomicType(item);
-        if (str.defined()) {
-          items.push_back(str.value());
-        } else {
-          items.clear();
-          break;
-        }
-      }
-      value = JoinString(items, ',');
+      value = String(StringifyArray(*array));
     } else {
       value = StringifyAtomicType(obj);
     }
-    if (value.defined()) {
-      result.push_back("-" + key + "=" + value.value());
+    if (!value.empty()) {
+      result.push_back("-" + key + "=" + value);
     }
   }
-  return JoinString(result, ' ');
+  return String(JoinString(result, ' '));
 }
 
 const std::string& TargetNode::str() const {
@@ -387,6 +564,7 @@ const std::string& TargetNode::str() const {
     if (Optional<String> attrs_str = TargetInternal::StringifyAttrsToRaw(attrs)) {
       os << ' ' << attrs_str.value();
     }
+
     str_repr_ = os.str();
   }
   return str_repr_;
@@ -420,6 +598,31 @@ Target::Target(Target target, Target host) {
   ObjectPtr<TargetNode> n = make_object<TargetNode>(*target.get());
   n->host = std::move(host);
   data_ = std::move(n);
+}
+
+Target::Target(TargetKind kind, Optional<ObjectRef> host, String tag, Array<String> keys,
+               Map<String, ObjectRef> attrs) {
+  auto data = runtime::make_object<TargetNode>();
+  data->kind = std::move(kind);
+  data->host = std::move(host);
+  data->tag = std::move(tag);
+  data->keys = std::move(keys);
+  data->attrs = std::move(attrs);
+  data_ = std::move(data);
+}
+
+bool Target::IsExternalCodegen() const {
+  TargetKindAttrMap<Bool> is_external_codegen_map =
+      TargetKind::GetAttrMap<Bool>(tvm::attr::kIsExternalCodegen);
+  TargetKindAttrMap<FTVMRelayToTIR> relay_to_tir_map =
+      TargetKind::GetAttrMap<FTVMRelayToTIR>(tvm::attr::kRelayToTIR);
+  return is_external_codegen_map.get(get()->kind, Bool(false)) ||
+         relay_to_tir_map.count(get()->kind);
+}
+
+bool Target::IsExternalCodegenFor(const Target& that) const {
+  return get()->GetTargetDeviceType() == that->GetTargetDeviceType() && IsExternalCodegen() &&
+         !that.IsExternalCodegen();
 }
 
 std::vector<std::string> TargetNode::GetKeys() const {
@@ -457,8 +660,80 @@ Map<String, ObjectRef> TargetNode::Export() const {
   return result;
 }
 
-Optional<Target> TargetNode::GetHost() const {
-  return GetRef<Optional<Target>>(this->host.as<TargetNode>());
+Optional<Target> TargetNode::GetHost() const { return this->host.as<Target>(); }
+
+Target Target::WithoutHost() const {
+  if ((*this)->GetHost()) {
+    auto output = make_object<TargetNode>(*get());
+    output->host = NullOpt;
+    return Target(output);
+  } else {
+    return *this;
+  }
+}
+
+int TargetNode::GetTargetDeviceType() const {
+  if (Optional<Integer> device_type = GetAttr<Integer>("target_device_type")) {
+    return Downcast<Integer>(device_type)->value;
+  }
+  return kind->default_device_type;
+}
+
+bool TargetNode::HasKey(const std::string& query_key) const {
+  return std::any_of(keys.begin(), keys.end(),
+                     [&query_key](const auto& key) { return key == query_key; });
+}
+
+String TargetNode::ToDebugString() const {
+  std::ostringstream os;
+  os << "Target(";
+  os << "id=" << std::hex << reinterpret_cast<size_t>(this);
+  os << ", kind='" << kind->name << "'";
+  if (!tag.empty()) {
+    os << ", tag='" << tag << "'";
+  }
+  if (!keys.empty()) {
+    os << ", keys={";
+    bool first = true;
+    for (const auto& key : keys) {
+      if (!first) {
+        os << ", ";
+      }
+      os << "'" << key << "'";
+      first = false;
+    }
+    os << "}";
+  }
+  if (!attrs.empty()) {
+    os << ", attrs={";
+    bool first = true;
+    for (const auto& pair : attrs) {
+      if (!first) {
+        os << ", ";
+      }
+      os << "'" << pair.first << "': " << pair.second;
+      first = false;
+    }
+    os << "}";
+  }
+  if (host.defined()) {
+    os << ", host=" << GetHost().value()->ToDebugString();
+  }
+  os << ")";
+  return os.str();
+}
+
+bool TargetNode::SEqualReduce(const TargetNode* other, SEqualReducer equal) const {
+  return equal(kind.get(), other->kind.get()) && equal(host, other->host) &&
+         equal(tag, other->tag) && equal(keys, other->keys) && equal(attrs, other->attrs);
+}
+
+void TargetNode::SHashReduce(SHashReducer hash_reduce) const {
+  hash_reduce(kind.get());
+  hash_reduce(host);
+  hash_reduce(tag);
+  hash_reduce(keys);
+  hash_reduce(attrs);
 }
 
 /*! \brief Entry to hold the Target context stack. */
@@ -549,24 +824,14 @@ ObjectPtr<Object> TargetInternal::FromConfigString(const String& config_str) {
 }
 
 ObjectPtr<Object> TargetInternal::FromRawString(const String& target_str) {
+  ICHECK_GT(target_str.length(), 0) << "Cannot parse empty target string";
   // Split the string by empty spaces
-  std::string name;
-  std::vector<std::string> options;
-  std::string str;
-  for (std::istringstream is(target_str); is >> str;) {
-    if (name.empty()) {
-      name = str;
-    } else {
-      options.push_back(str);
-    }
-  }
-  if (name.empty()) {
-    throw Error(": Cannot parse empty target string");
-  }
+  std::vector<std::string> options = SplitString(std::string(target_str), ' ');
+  std::string name = options[0];
   // Create the target config
   std::unordered_map<String, ObjectRef> config = {{"kind", String(name)}};
   TargetKind kind = GetTargetKind(name);
-  for (size_t iter = 0, end = options.size(); iter < end;) {
+  for (size_t iter = 1, end = options.size(); iter < end;) {
     std::string key, value;
     try {
       // Parse key-value pair
@@ -588,17 +853,34 @@ ObjectPtr<Object> TargetInternal::FromRawString(const String& target_str) {
   return TargetInternal::FromConfig(config);
 }
 
-ObjectPtr<Object> TargetInternal::FromConfig(std::unordered_map<String, ObjectRef> config) {
+ObjectPtr<Object> TargetInternal::FromConfig(Map<String, ObjectRef> config) {
   const String kKind = "kind";
   const String kTag = "tag";
   const String kKeys = "keys";
   const String kDeviceName = "device";
   const String kHost = "host";
+  const String kFeatures = "features";
   ObjectPtr<TargetNode> target = make_object<TargetNode>();
+
+  ICHECK(!config.count(kFeatures)) << "Target Features should be generated by Target parser";
+
   // parse 'kind'
   if (config.count(kKind)) {
-    if (const auto* kind = config[kKind].as<StringObj>()) {
-      target->kind = GetTargetKind(GetRef<String>(kind));
+    if (auto kind = config[kKind].as<String>()) {
+      target->kind = GetTargetKind(kind.value());
+      ICHECK(!(target->kind->preprocessor != nullptr && target->kind->target_parser != nullptr))
+          << "Cannot use both set_attrs_preprocessor and set_target_parser";
+
+      // Run JSON Parser over JSON input
+      if (target->kind->target_parser != nullptr) {
+        VLOG(9) << "TargetInternal::FromConfig - Running target_parser";
+        config = target->kind->target_parser(config);
+        if (config.count(kFeatures)) {
+          target->features = Downcast<Map<String, ObjectRef>>(config[kFeatures]);
+          config.erase(kFeatures);
+        }
+      }
+
       config.erase(kKind);
     } else {
       throw Error(": Expect type of field \"kind\" is String, but get type: " +
@@ -609,8 +891,8 @@ ObjectPtr<Object> TargetInternal::FromConfig(std::unordered_map<String, ObjectRe
   }
   // parse "tag"
   if (config.count(kTag)) {
-    if (const auto* tag = config[kTag].as<StringObj>()) {
-      target->tag = GetRef<String>(tag);
+    if (auto tag = config[kTag].as<String>()) {
+      target->tag = tag.value();
       config.erase(kTag);
     } else {
       throw Error(": Expect type of field \"tag\" is String, but get type: " +
@@ -622,12 +904,13 @@ ObjectPtr<Object> TargetInternal::FromConfig(std::unordered_map<String, ObjectRe
   // parse "keys"
   {
     std::vector<String> keys;
-    if (config.count(kKeys)) {
+    bool has_user_keys = config.count(kKeys);
+    if (has_user_keys) {
       // user provided keys
       if (const auto* cfg_keys = config[kKeys].as<ArrayNode>()) {
         for (const ObjectRef& e : *cfg_keys) {
-          if (const auto* key = e.as<StringObj>()) {
-            keys.push_back(GetRef<String>(key));
+          if (auto key = e.as<String>()) {
+            keys.push_back(key.value());
           } else {
             throw Error(
                 ": Expect 'keys' to be an array of strings, but it "
@@ -642,13 +925,15 @@ ObjectPtr<Object> TargetInternal::FromConfig(std::unordered_map<String, ObjectRe
     }
     // add device name
     if (config.count(kDeviceName)) {
-      if (const auto* device = config.at(kDeviceName).as<StringObj>()) {
-        keys.push_back(GetRef<String>(device));
+      if (auto device = config.at(kDeviceName).as<String>()) {
+        keys.push_back(device.value());
       }
     }
-    // add default keys
-    for (const auto& key : target->kind->default_keys) {
-      keys.push_back(key);
+    if (!has_user_keys) {
+      // add default keys
+      for (const auto& key : target->kind->default_keys) {
+        keys.push_back(key);
+      }
     }
     // de-duplicate keys
     target->keys = DeduplicateKeys(keys);
@@ -673,6 +958,21 @@ ObjectPtr<Object> TargetInternal::FromConfig(std::unordered_map<String, ObjectRe
       throw Error(": Error when parsing target[\"" + key + "\"]" + e.what());
     }
   }
+
+  // If requested, query attributes from the device.  User-specified
+  // parameters take precedence over queried parameters.
+  if (attrs.count("from_device")) {
+    int device_id = Downcast<Integer>(attrs.at("from_device")).IntValue();
+    attrs.erase("from_device");
+    auto device_params = QueryDevice(device_id, target.get());
+
+    for (const auto& kv : device_params) {
+      if (attrs.count(kv.first) == 0) {
+        attrs[kv.first] = kv.second;
+      }
+    }
+  }
+
   // set default attribute values if they do not exist
   for (const auto& kv : target->kind->key2default_) {
     if (!attrs.count(kv.first)) {
@@ -685,7 +985,72 @@ ObjectPtr<Object> TargetInternal::FromConfig(std::unordered_map<String, ObjectRe
   } else {
     target->attrs = attrs;
   }
+
   return target;
+}  // namespace tvm
+
+std::unordered_map<String, ObjectRef> TargetInternal::QueryDevice(int device_id,
+                                                                  const TargetNode* target) {
+  std::unordered_map<String, ObjectRef> output;
+
+  Device device{static_cast<DLDeviceType>(target->GetTargetDeviceType()), device_id};
+
+  auto api = runtime::DeviceAPI::Get(device, true);
+  if (!api) {
+    LOG(INFO) << "Requested reading the parameters for " << target->kind->name << " from device_id "
+              << device_id << ", but support for this runtime wasn't enabled at compile-time.  "
+              << "Using default target parameters.";
+    return output;
+  }
+
+  TVMRetValue ret;
+  api->GetAttr(device, runtime::kExist, &ret);
+  bool device_exists = ret;
+  if (!device_exists) {
+    ICHECK(device_exists) << "Requested reading the parameters for " << target->kind->name
+                          << " from device_id " << device_id << ", but device_id " << device_id
+                          << " doesn't exist.  Using default target parameters.";
+    return output;
+  }
+
+  for (const auto& kv : target->kind->key2vtype_) {
+    const String& key = kv.first;
+    const TargetKindNode::ValueTypeInfo& type_info = kv.second;
+
+    TVMRetValue ret;
+    api->GetTargetProperty(device, key, &ret);
+
+    switch (ret.type_code()) {
+      case kTVMNullptr:
+        // Nothing returned for this parameter, move on to the next one.
+        continue;
+
+      case kTVMArgInt:
+        if (type_info.type_index == Integer::ContainerType::_GetOrAllocRuntimeTypeIndex()) {
+          output[key] = Integer(static_cast<int64_t>(ret));
+        } else if (type_info.type_index == Bool::ContainerType::_GetOrAllocRuntimeTypeIndex()) {
+          output[key] = Bool(static_cast<bool>(ret));
+        } else {
+          LOG(FATAL) << "Expected " << type_info.type_key << " parameter for attribute '" << key
+                     << "', but received integer from device api";
+        }
+        break;
+
+      case kTVMStr:
+        ICHECK_EQ(type_info.type_index, String::ContainerType::_GetOrAllocRuntimeTypeIndex())
+            << "Expected " << type_info.type_key << " parameter for attribute '" << key
+            << "', but received string from device api";
+        output[key] = String(ret.operator std::string());
+        break;
+
+      default:
+        LOG(FATAL) << "Expected " << type_info.type_key << " parameter for attribute '" << key
+                   << "', but received TVMArgTypeCode(" << ret.type_code() << ") from device api";
+        break;
+    }
+  }
+
+  return output;
 }
 
 /**********  Registry  **********/
@@ -696,6 +1061,13 @@ TVM_REGISTER_GLOBAL("target.TargetExitScope").set_body_typed(TargetInternal::Exi
 TVM_REGISTER_GLOBAL("target.TargetCurrent").set_body_typed(Target::Current);
 TVM_REGISTER_GLOBAL("target.TargetExport").set_body_typed(TargetInternal::Export);
 TVM_REGISTER_GLOBAL("target.WithHost").set_body_typed(TargetInternal::WithHost);
+TVM_REGISTER_GLOBAL("target.TargetGetDeviceType").set_body_typed([](const Target& target) {
+  return target->GetTargetDeviceType();
+});
+TVM_REGISTER_GLOBAL("target.TargetGetFeature")
+    .set_body_typed([](const Target& target, const String& feature_key) {
+      return target->GetFeature<ObjectRef>(feature_key);
+    });
 
 TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
     .set_dispatch<TargetNode>([](const ObjectRef& obj, ReprPrinter* p) {
