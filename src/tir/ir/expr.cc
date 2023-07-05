@@ -79,7 +79,7 @@ Var::Var(String name_hint, Type type_annotation, Span span) {
   data_ = std::move(n);
 }
 
-Var Var::copy_with_suffix(const String& suffix) const {
+Var Var::copy_with_name(const String& name) const {
   const VarNode* node = get();
   ObjectPtr<VarNode> new_ptr;
   if (auto* ptr = this->as<SizeVarNode>()) {
@@ -87,8 +87,12 @@ Var Var::copy_with_suffix(const String& suffix) const {
   } else {
     new_ptr = make_object<VarNode>(*node);
   }
-  new_ptr->name_hint = new_ptr->name_hint + suffix;
+  new_ptr->name_hint = name;
   return Var(new_ptr);
+}
+
+Var Var::copy_with_suffix(const String& suffix) const {
+  return this->copy_with_name(get()->name_hint + suffix);
 }
 
 Var Var::copy_with_dtype(DataType dtype) const {
