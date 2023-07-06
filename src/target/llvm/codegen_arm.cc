@@ -37,12 +37,12 @@ namespace codegen {
 
 // ARM specific code generator, this is used as an example on
 // how to override behavior llvm code generator for specific target
-class CodeGenARM final : public CodeGenCPU {
+class CodeGenARM : public CodeGenCPU {
  public:
   CodeGenARM() = default;
   virtual ~CodeGenARM() = default;
 
-  void InitTarget() final {
+  void InitTarget() {
     // set native vector bits.
     native_vector_bits_ = 16 * 8;
     CodeGenCPU::InitTarget();

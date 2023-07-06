@@ -52,14 +52,14 @@ void print_LLVM_val(llvm::Value* val) {
 // AArch64 code generation
 class CodeGenAArch64 final : public CodeGenCPU {
  public:
-  void InitTarget(llvm::TargetMachine* tm) final {
+  void InitTarget(llvm::TargetMachine* tm) {
     // set native vector bits.
     native_vector_bits_ = 16 * 8;
-    CodeGenCPU::InitTarget(tm);
+    // CodeGenCPU::InitTarget(tm);
   }
-  llvm::Value* VisitExpr_(const LoadNode* op);
+  // llvm::Value* VisitExpr_(const LoadNode* op);
+  // void VisitStmt_(const StoreNode* op);
   void VisitStmt_(const ForNode* op);
-  void VisitStmt_(const StoreNode* op);
 
  private:
   // SVE LLVM intrinsics
@@ -191,89 +191,89 @@ void CodeGenAArch64::CreateSVEFor(llvm::Value* begin, llvm::Value* end, llvm::Va
   function_->print(llvm::errs());
 }
 
-llvm::Value* CodeGenAArch64::VisitExpr_(const LoadNode* op) {
-  DataType t = op->dtype;
-  if (!t.is_scalable()) return CodeGenCPU::VisitExpr_(op);
-  llvm::Value* buffer = MakeValue(op->buffer_var);
+// llvm::Value* CodeGenAArch64::VisitExpr_(const BufferLoadNode* op) {
+//   DataType t = op->dtype;
+//   if (!t.is_scalable()) return CodeGenCPU::VisitExpr_(op);
+//   llvm::Value* buffer = MakeValue(op->buffer_var);
 
-  // scalable vector load
-  const RampNode* ramp = op->index.as<RampNode>();
-  ICHECK(ramp);
-  // TODO(giuseros): use gather to address a load-with-stride-greater-than-1
-  ICHECK(is_one(ramp->stride));
+//   // scalable vector load
+//   const RampNode* ramp = op->index.as<RampNode>();
+//   ICHECK(ramp);
+//   // TODO(giuseros): use gather to address a load-with-stride-greater-than-1
+//   ICHECK(is_one(ramp->stride));
 
-  int alignment, native_bits;
-  GetAlignment(t, op->buffer_var.get(), ramp->base, &alignment, &native_bits);
-  ICHECK_EQ(ramp->lanes, t.lanes());
-  llvm::Value* ptr = CreateBufferPtr(t.element_of(), buffer, MakeValue(ramp->base));
+//   int alignment, native_bits;
+//   GetAlignment(t, op->buffer_var.get(), ramp->base, &alignment, &native_bits);
+//   ICHECK_EQ(ramp->lanes, t.lanes());
+//   llvm::Value* ptr = CreateBufferPtr(t.element_of(), buffer, MakeValue(ramp->base));
 
-  llvm::Value* load = sve_load(ptr, t);
-  return load;
-}
+//   llvm::Value* load = sve_load(ptr, t);
+//   return load;
+// }
 
-void CodeGenAArch64::VisitStmt_(const StoreNode* op) {
-  ICHECK(is_one(op->predicate)) << op->predicate;
-  DataType t = op->value.dtype();
-  bool is_volatile = volatile_buf_.count(op->buffer_var.get());
-  llvm::Value* buffer = MakeValue(op->buffer_var);
-  llvm::Value* index = MakeValue(op->index);
-  llvm::Value* value = MakeValue(op->value);
+// void CodeGenAArch64::VisitStmt_(const BufferStoreNode* op) {
+//   ICHECK(is_one(op->predicate)) << op->predicate;
+//   DataType t = op->value.dtype();
+//   bool is_volatile = volatile_buf_.count(op->buffer_var.get());
+//   llvm::Value* buffer = MakeValue(op->buffer_var);
+//   llvm::Value* index = MakeValue(op->index);
+//   llvm::Value* value = MakeValue(op->value);
 
-  if (t.lanes() == 1) {
-    int alignment, native_bits;
-    GetAlignment(t, op->buffer_var.get(), op->index, &alignment, &native_bits);
-    llvm::Value* ptr = CreateBufferPtr(t, buffer, index);
-#if TVM_LLVM_VERSION >= 110
-    llvm::StoreInst* store =
-        builder_->CreateAlignedStore(value, ptr, llvm::Align(alignment), is_volatile);
-#else
-    llvm::StoreInst* store = builder_->CreateAlignedStore(value, ptr, alignment, is_volatile);
-#endif
-    AddAliasInfo(store, op->buffer_var.get(), op->index);
-    return;
-  } else {
-    // vector store
-    unsigned addrspace = llvm::dyn_cast<llvm::PointerType>(buffer->getType())->getAddressSpace();
-    if (const RampNode* ramp = op->index.as<RampNode>()) {
-      if (is_one(ramp->stride)) {
-        int alignment, native_bits;
-        GetAlignment(t, op->buffer_var.get(), ramp->base, &alignment, &native_bits);
-        ICHECK_EQ(ramp->lanes, t.lanes());
-        llvm::Value* ptr = CreateBufferPtr(t.element_of(), buffer, MakeValue(ramp->base));
-        if (!t.is_scalable()) {
-          ptr = builder_->CreatePointerCast(ptr, DTypeToLLVMType(t)->getPointerTo(addrspace));
-        }
-#if TVM_LLVM_VERSION >= 110
-        if (t.is_scalable()) {
-          sve_store(ptr, value, t);
-          return;
-        }
-        llvm::StoreInst* store =
-            builder_->CreateAlignedStore(value, ptr, llvm::Align(alignment), is_volatile);
-#else
-        llvm::StoreInst* store = builder_->CreateAlignedStore(value, ptr, alignment, is_volatile);
-#endif
-        AddAliasInfo(store, op->buffer_var.get(), op->index);
-        return;
-      }
-    }
-  }
-  ICHECK_GE(t.bits(), 8);
-  // scalarized store.
-  int basic_align = t.bits() / 8;
-  auto f = [&](int i, llvm::Value* index) {
-    llvm::Value* ptr = CreateBufferPtr(t.element_of(), buffer, index);
-#if TVM_LLVM_VERSION >= 110
-    llvm::StoreInst* store = builder_->CreateAlignedStore(
-        builder_->CreateExtractElement(value, i), ptr, llvm::Align(basic_align), is_volatile);
-#else
-    llvm::StoreInst* store = builder_->CreateAlignedStore(builder_->CreateExtractElement(value, i),
-                                                          ptr, basic_align, is_volatile);
-#endif
-    AddAliasInfo(store, op->buffer_var.get(), PrimExpr());
-  };
-  this->Scalarize(op->index, f);
-}
+//   if (t.lanes() == 1) {
+//     int alignment, native_bits;
+//     GetAlignment(t, op->buffer_var.get(), op->index, &alignment, &native_bits);
+//     llvm::Value* ptr = CreateBufferPtr(t, buffer, index);
+// #if TVM_LLVM_VERSION >= 110
+//     llvm::StoreInst* store =
+//         builder_->CreateAlignedStore(value, ptr, llvm::Align(alignment), is_volatile);
+// #else
+//     llvm::StoreInst* store = builder_->CreateAlignedStore(value, ptr, alignment, is_volatile);
+// #endif
+//     AddAliasInfo(store, op->buffer_var.get(), op->index);
+//     return;
+//   } else {
+//     // vector store
+//     unsigned addrspace = llvm::dyn_cast<llvm::PointerType>(buffer->getType())->getAddressSpace();
+//     if (const RampNode* ramp = op->index.as<RampNode>()) {
+//       if (is_one(ramp->stride)) {
+//         int alignment, native_bits;
+//         GetAlignment(t, op->buffer_var.get(), ramp->base, &alignment, &native_bits);
+//         ICHECK_EQ(ramp->lanes, t.lanes());
+//         llvm::Value* ptr = CreateBufferPtr(t.element_of(), buffer, MakeValue(ramp->base));
+//         if (!t.is_scalable()) {
+//           ptr = builder_->CreatePointerCast(ptr, DTypeToLLVMType(t)->getPointerTo(addrspace));
+//         }
+// #if TVM_LLVM_VERSION >= 110
+//         if (t.is_scalable()) {
+//           sve_store(ptr, value, t);
+//           return;
+//         }
+//         llvm::StoreInst* store =
+//             builder_->CreateAlignedStore(value, ptr, llvm::Align(alignment), is_volatile);
+// #else
+//         llvm::StoreInst* store = builder_->CreateAlignedStore(value, ptr, alignment, is_volatile);
+// #endif
+//         AddAliasInfo(store, op->buffer_var.get(), op->index);
+//         return;
+//       }
+//     }
+//   }
+//   ICHECK_GE(t.bits(), 8);
+//   // scalarized store.
+//   int basic_align = t.bits() / 8;
+//   auto f = [&](int i, llvm::Value* index) {
+//     llvm::Value* ptr = CreateBufferPtr(t.element_of(), buffer, index);
+// #if TVM_LLVM_VERSION >= 110
+//     llvm::StoreInst* store = builder_->CreateAlignedStore(
+//         builder_->CreateExtractElement(value, i), ptr, llvm::Align(basic_align), is_volatile);
+// #else
+//     llvm::StoreInst* store = builder_->CreateAlignedStore(builder_->CreateExtractElement(value, i),
+//                                                           ptr, basic_align, is_volatile);
+// #endif
+//     AddAliasInfo(store, op->buffer_var.get(), PrimExpr());
+//   };
+//   this->Scalarize(op->index, f);
+// }
 
 void CodeGenAArch64::VisitStmt_(const ForNode* op) {
   ICHECK(is_zero(op->min));

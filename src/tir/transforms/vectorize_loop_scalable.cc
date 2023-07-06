@@ -50,51 +50,6 @@ inline PrimExpr BroadcastToVL(PrimExpr e, int min_num_lanes) {
   return Broadcast(e, min_num_lanes, true);
 }
 
-// Rewrite vectorized allocation access
-// This is necessary for making each vector component containing its own workspace.
-// Originates from Halide's loop vectorizer
-//
-// s[i] = s[i * lanes + var]
-//
-// The same principle applies when using one thread to simulate multiple context.
-//
-class VecAllocAccess : public StmtExprMutator {
- public:
-  VecAllocAccess(const VarNode* buf, Var var, int var_lanes)
-      : buf_(buf), var_(var), var_lanes_(var_lanes) {}
-  // Load
-  PrimExpr VisitExpr_(const LoadNode* op) final {
-    PrimExpr expr = StmtExprMutator::VisitExpr_(op);
-    op = expr.as<LoadNode>();
-    // type_ = expr->dtype;
-    if (op->buffer_var.get() == buf_) {
-      return Load(op->dtype, op->buffer_var, op->index * var_lanes_ + var_, op->predicate);
-    } else {
-      return expr;
-    }
-  }
-  // Store
-  Stmt VisitStmt_(const StoreNode* op) final {
-    Stmt stmt = StmtExprMutator::VisitStmt_(op);
-    op = stmt.as<StoreNode>();
-    if (op->buffer_var.get() == buf_) {
-      return Store(op->buffer_var, op->value, op->index * var_lanes_ + var_, op->predicate);
-    } else {
-      return stmt;
-    }
-  }
-
- private:
-  // buffer var
-  const VarNode* buf_;
-  // variable to be replaced
-  Var var_;
-  // the lanes.
-  int var_lanes_;
-  // The type
-  // DataType type_;
-};
-
 // We use ExprFunctor directly instead of StmtExprMutator
 // This is because the transformation can change the dtype of the Expr
 // The existing ExprMutator transformation rules may not be well defined.
@@ -297,19 +252,19 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
     }
   }
   // Load
-  PrimExpr VisitExpr_(const LoadNode* op) final {
-    DataType base_type = op->dtype;
-    auto load_type = DataType(base_type.code(), base_type.bits(), type_.lanes(), true);
-    PrimExpr index = this->VisitExpr(op->index);
-    PrimExpr pred = this->VisitExpr(op->predicate);
-    if (index.same_as(op->index) && pred.same_as(op->predicate)) {
-      return GetRef<PrimExpr>(op);
-    } else {
-      // int lanes = std::max(index.dtype().lanes(), pred.dtype().lanes());
-      return Load(load_type, op->buffer_var, BroadcastToVL(index, type_.lanes()),
-                  BroadcastToVL(pred, type_.lanes()));
-    }
-  }
+  // PrimExpr VisitExpr_(const BufferLoadNode* op) final {
+  //   DataType base_type = op->dtype;
+  //   auto load_type = DataType(base_type.code(), base_type.bits(), type_.lanes(), true);
+  //   PrimExpr index = this->VisitExpr(op->index);
+  //   PrimExpr pred = this->VisitExpr(op->predicate);
+  //   if (index.same_as(op->index) && pred.same_as(op->predicate)) {
+  //     return GetRef<PrimExpr>(op);
+  //   } else {
+  //     // int lanes = std::max(index.dtype().lanes(), pred.dtype().lanes());
+  //     return Load(load_type, op->buffer_var, BroadcastToVL(index, type_.lanes()),
+  //                 BroadcastToVL(pred, type_.lanes()));
+  //   }
+  // }
   // Let
   PrimExpr VisitExpr_(const LetNode* op) final {
     PrimExpr value = this->VisitExpr(op->value);
@@ -339,37 +294,37 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
     }
   }
   // Store
-  Stmt VisitStmt_(const StoreNode* op) final {
-    // type_ = op->buffer_var->dtype.with_scalable_lanes();
-    DataType base_type = op->value.dtype();
-    type_ =
-        DataType(base_type.code(), base_type.bits(), min_vector_len_bits_ / base_type.bits(), true);
+  // Stmt VisitStmt_(const StoreNode* op) final {
+  //   // type_ = op->buffer_var->dtype.with_scalable_lanes();
+  //   DataType base_type = op->value.dtype();
+  //   type_ =
+  //       DataType(base_type.code(), base_type.bits(), min_vector_len_bits_ / base_type.bits(), true);
 
-    PrimExpr value = this->VisitExpr(op->value);
-    //    type_ = value.dtype().with_scalable_lanes();
+  //   PrimExpr value = this->VisitExpr(op->value);
+  //   //    type_ = value.dtype().with_scalable_lanes();
 
-    PrimExpr index = this->VisitExpr(op->index);
-    PrimExpr pred = this->VisitExpr(op->predicate);
-    if (value.same_as(op->value) && index.same_as(op->index)) {
-      return GetRef<Stmt>(op);
-    } else {
-      int min_lanes = type_.lanes();
-      auto vla_loop_body = Store(op->buffer_var, BroadcastToVL(value, min_lanes),
-                                 BroadcastToVL(index, min_lanes), BroadcastToVL(pred, min_lanes));
-      if (need_loop_) {
-        need_loop_ = false;
-        return For(var_, min_, var_lanes_, ForKind::kSerial, vla_loop_body, NullOpt, 
-                   Map<String, ObjectRef>(), Span(), true, type_.lanes());
+  //   PrimExpr index = this->VisitExpr(op->index);
+  //   PrimExpr pred = this->VisitExpr(op->predicate);
+  //   if (value.same_as(op->value) && index.same_as(op->index)) {
+  //     return GetRef<Stmt>(op);
+  //   } else {
+  //     int min_lanes = type_.lanes();
+  //     auto vla_loop_body = Store(op->buffer_var, BroadcastToVL(value, min_lanes),
+  //                                BroadcastToVL(index, min_lanes), BroadcastToVL(pred, min_lanes));
+  //     if (need_loop_) {
+  //       need_loop_ = false;
+  //       return For(var_, min_, var_lanes_, ForKind::kSerial, vla_loop_body, NullOpt, 
+  //                  Map<String, ObjectRef>(), Span(), true, type_.lanes());
 
-              // TVM_DLL For(Var loop_var, PrimExpr min, PrimExpr extent, ForKind kind, Stmt body,
-              // Optional<IterVar> thread_binding = NullOpt,
-              // Map<String, ObjectRef> annotations = Map<String, ObjectRef>(), Span span = Span(), 
-              // bool is_vla = false, int stride = 1);
-      } else {
-        return vla_loop_body;
-      }
-    }
-  }
+  //             // TVM_DLL For(Var loop_var, PrimExpr min, PrimExpr extent, ForKind kind, Stmt body,
+  //             // Optional<IterVar> thread_binding = NullOpt,
+  //             // Map<String, ObjectRef> annotations = Map<String, ObjectRef>(), Span span = Span(), 
+  //             // bool is_vla = false, int stride = 1);
+  //     } else {
+  //       return vla_loop_body;
+  //     }
+  //   }
+  // }
   // For
   Stmt VisitStmt_(const ForNode* op) final {
     // TODO(giuseros): Add a configuration parameter to enable
@@ -390,7 +345,7 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
     }
     Stmt else_case;
     if (op->else_case.defined()) {
-      else_case = this->VisitStmt(op->else_case);
+      else_case = this->VisitStmt(op->else_case.value());
     }
     if (condition.same_as(op->condition) && then_case.same_as(op->then_case) &&
         else_case.same_as(op->else_case)) {
@@ -441,9 +396,9 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
     // place the vector lanes in least significant dimension.
     extents.push_back(var_lanes_);
     // rewrite access to buffer internally.
-    Stmt body = VecAllocAccess(op->buffer_var.get(), var_, var_lanes_)(op->body);
-    body = this->VisitStmt(body);
-    return Allocate(op->buffer_var, op->dtype, extents, condition, body);
+    // Stmt body = VecAllocAccess(op->buffer_var.get(), var_, var_lanes_)(op->body);
+    // body = this->VisitStmt(body);
+    return Allocate(op->buffer_var, op->dtype, extents, condition, op->body);
   }
 
   // scalarize the statment

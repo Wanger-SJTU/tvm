@@ -255,14 +255,12 @@ TVM_REGISTER_OP("tir.q_multiply_shift")
         // Only int32 types are supported (any number of lanes is allowed)
         ICHECK(s.dtype().code() == DLDataTypeCode::kDLInt && s.dtype().bits() == 32);
 
-<<<<<<< HEAD
+        //TODO:chenghao
         DataType hp_dtype = DataType::Int(64, x.dtype().lanes(), x.dtype().is_scalable());
         DataType lp_dtype = DataType::Int(32, x.dtype().lanes(), x.dtype().is_scalable());
 
         // 1) Calculating the integer multiplier and integer shift
-=======
         // Calculating integer shifts
->>>>>>> main
         PrimExpr zero = make_const(s.dtype(), 0);
         PrimExpr left_shift = tir::Select(s > zero, s, zero);
         PrimExpr right_shift = tir::Select(s > zero, zero, -s);
