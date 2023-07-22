@@ -166,11 +166,18 @@ class CodeGenAArch64 final : public CodeGenARM {
     native_vector_bits_ = 16 * 8;
     CodeGenCPU::InitTarget();
   }
-  // llvm::Value* VisitExpr_(const LoadNode* op);
-  // void VisitStmt_(const StoreNode* op);
+  llvm::Value* VisitExpr_(const BufferLoadNode* op);
+  void VisitStmt_(const BufferStoreNode* op);
   void VisitStmt_(const ForNode* op);
 
+  void BufferAccessHelper(
+    Buffer buffer, Array<PrimExpr> indices, DataType value_dtype,
+    std::function<llvm::Instruction*(TypedPointer buffer_ptr, int subelement_i, int alignment,
+                                     bool is_volatile)>
+        make_instruction);
+
  private:
+  //
   // SVE LLVM intrinsics
   llvm::Value* sve_stride(int min_lanes);
   llvm::Value* sve_whilelt(llvm::Value* a, llvm::Value* b, int min_lanes);
@@ -303,27 +310,150 @@ void CodeGenAArch64::CreateSVEFor(llvm::Value* begin, llvm::Value* end, llvm::Va
   function_->print(llvm::errs());
 }
 
-// llvm::Value* CodeGenAArch64::VisitExpr_(const BufferLoadNode* op) {
-//   DataType t = op->dtype;
-//   if (!t.is_scalable()) return CodeGenCPU::VisitExpr_(op);
-//   llvm::Value* buffer = MakeValue(op->buffer_var);
+void CodeGenAArch64::BufferAccessHelper(
+    Buffer buffer, Array<PrimExpr> indices, DataType value_dtype,
+    std::function<llvm::Instruction*(TypedPointer buffer_ptr, int subelement_i, int alignment,
+                                     bool is_volatile)>
+        make_instruction) {
+  DataType buffer_element_dtype = buffer->dtype;
 
-//   // scalable vector load
-//   const RampNode* ramp = op->index.as<RampNode>();
-//   ICHECK(ramp);
-//   // TODO(giuseros): use gather to address a load-with-stride-greater-than-1
-//   ICHECK(is_one(ramp->stride));
+  ICHECK_GE(indices.size(), 1)
+      << "Buffer " << buffer->name << " is accessed with no indices.  "
+      << "0-d scalar buffers are expected to be flattened to 1-d buffers prior to codegen.";
 
-//   int alignment, native_bits;
-//   GetAlignment(t, op->buffer_var.get(), ramp->base, &alignment, &native_bits);
-//   ICHECK_EQ(ramp->lanes, t.lanes());
-//   llvm::Value* ptr = CreateBufferPtr(t.element_of(), buffer, MakeValue(ramp->base));
+  // Only the last index is allowed to be multi-lane.  All earlier
+  // indices must be scalar.  This only matters for subclasses of
+  // CodeGenLLVM, because the default implementation of GetBufferPtr
+  // requires 1-d indices.
+  std::vector<llvm::Value*> earlier_index_values;
+  for (size_t i = 0; i < indices.size() - 1; i++) {
+    ICHECK_EQ(indices[i].dtype().lanes(), 1)
+        << "Buffer " << buffer->name << " is accessed with a multi-lane index at position " << i
+        << ".  Multi-lane indices are only supported as the last index.";
+    earlier_index_values.push_back(MakeValue(indices[i]));
+  }
 
-//   llvm::Value* load = sve_load(ptr, t);
-//   return load;
-// }
+  PrimExpr last_index = indices[indices.size() - 1];
+  ICHECK_EQ(value_dtype.lanes(), last_index.dtype().lanes() * buffer_element_dtype.lanes());
 
-// void CodeGenAArch64::VisitStmt_(const BufferStoreNode* op) {
+  // Record index and elemtype in original form used for alias info
+  PrimExpr last_index_origin = last_index;
+  DataType buffer_element_dtype_origin = buffer_element_dtype;
+
+  bool is_volatile = volatile_buf_.count(buffer->data.get());
+
+  // If the buffer index is a contiguous ramp node, we only need to
+  // access the first element, then cast to the value type.
+  if (const RampNode* ramp_index = last_index.as<RampNode>()) {
+    if (is_one(ramp_index->stride)) {
+      last_index = ramp_index->base;
+    }
+  }
+
+  // All TVM arrays are densely packed.  If the vectorized LLVM type
+  // contains padding for alignment, we need to index based on the
+  // size of the scalar type to avoid introducing that padding.
+  if (last_index.dtype().lanes() == 1 && HasAlignmentPadding(buffer_element_dtype)) {
+    last_index = buffer_element_dtype.lanes() * last_index;
+    buffer_element_dtype = buffer_element_dtype.element_of();
+  }
+
+  int alignment;
+  if (last_index.dtype().lanes() == 1) {
+    // If we are accessing with a single index, then the vectorized
+    // element being accessed may require more alignment than the
+    // underlying data type.
+    int native_bits;
+    GetAlignment(value_dtype, buffer->data.get(), last_index, &alignment, &native_bits);
+  } else {
+    // Otherwise, alignment is based on the return value's scalar
+    // type.
+    ICHECK_GE(value_dtype.bits(), 8);
+    alignment = value_dtype.bits() / 8;
+  }
+
+  llvm::Value* cached_vector_index = nullptr;
+  for (int i = 0; i < last_index.dtype().lanes(); ++i) {
+    llvm::Value* last_index_value;
+    int subelement_i = i;
+    if (const RampNode* ramp = last_index.as<RampNode>()) {
+      PrimExpr offset = ramp->base + (ramp->stride * i);
+      last_index_value = MakeValue(offset);
+    } else if (last_index.dtype().lanes() > 1) {
+      if (i == 0) {
+        cached_vector_index = MakeValue(last_index);
+      }
+      last_index_value = builder_->CreateExtractElement(cached_vector_index, i);
+    } else {
+      last_index_value = MakeValue(last_index);
+      subelement_i = -1;
+    }
+
+    std::vector<llvm::Value*> all_index_values = earlier_index_values;
+    all_index_values.push_back(last_index_value);
+
+    TypedPointer buffer_ptr =
+        CreateBufferPtr(MakeValue(buffer->data), buffer_element_dtype, all_index_values,
+                        value_dtype.with_lanes(value_dtype.lanes() / last_index.dtype().lanes()));
+    auto instruction = make_instruction(buffer_ptr, subelement_i, alignment, is_volatile);
+    AddAliasInfo(instruction, buffer->data.get(), last_index_origin, buffer_element_dtype_origin);
+  }
+}
+
+llvm::Value* CodeGenAArch64::VisitExpr_(const BufferLoadNode* op) {
+  DataType value_dtype = op->dtype;
+
+  if (!value_dtype.is_scalable()) return CodeGenARM::VisitExpr_(op);
+
+  std::vector<llvm::Value*> loads;
+
+  auto make_load = [this, &loads](TypedPointer buffer_ptr, int /* subelement_i */, int alignment,
+                                  bool is_volatile) {
+#if TVM_LLVM_VERSION >= 110
+    auto load = builder_->CreateAlignedLoad(buffer_ptr.type, buffer_ptr.addr,
+                                            llvm::Align(alignment), is_volatile);
+#elif TVM_LLVM_VERSION >= 80
+    auto load =
+        builder_->CreateAlignedLoad(buffer_ptr.type, buffer_ptr.addr, alignment, is_volatile);
+#else
+    auto load = builder_->CreateAlignedLoad(buffer_ptr.addr, alignment, is_volatile);
+#endif
+
+    loads.push_back(load);
+    return load;
+  };
+
+  // Pass all indices into BufferAccessHelper.  In CodeGenLLVM,
+  // non-flat indices will result in an error in CreateBufferPtr, but
+  // a subclass may override CreateBufferPtr.
+  // TODO(chenghao): use gather to address a load-with-stride-greater-than-1
+  // ICHECK(is_one(ramp->stride));
+  BufferAccessHelper(op->buffer, op->indices, value_dtype, make_load);
+  
+  if (loads.size() == 1) {
+    return loads[0];
+  } else {
+    llvm::Value* ret = llvm::UndefValue::get(DTypeToLLVMType(value_dtype));
+    for (size_t i = 0; i < loads.size(); i++) {
+      ret = builder_->CreateInsertElement(ret, loads[i], ConstInt32(i));
+    }
+    return ret;
+  }
+
+  // // scalable vector load
+  // const RampNode* ramp = op->index.as<RampNode>();
+  // ICHECK(ramp);
+
+  // int alignment, native_bits;
+  // GetAlignment(t, op->buffer_var.get(), ramp->base, &alignment, &native_bits);
+  // ICHECK_EQ(ramp->lanes, t.lanes());
+  // llvm::Value* ptr = CreateBufferPtr(t.element_of(), buffer, MakeValue(ramp->base));
+
+  // llvm::Value* load = sve_load(ptr, t);
+  // return load;
+}
+
+void CodeGenAArch64::VisitStmt_(const BufferStoreNode* op) {
 //   ICHECK(is_one(op->predicate)) << op->predicate;
 //   DataType t = op->value.dtype();
 //   bool is_volatile = volatile_buf_.count(op->buffer_var.get());
@@ -385,7 +515,7 @@ void CodeGenAArch64::CreateSVEFor(llvm::Value* begin, llvm::Value* end, llvm::Va
 //     AddAliasInfo(store, op->buffer_var.get(), PrimExpr());
 //   };
 //   this->Scalarize(op->index, f);
-// }
+}
 
 void CodeGenAArch64::VisitStmt_(const ForNode* op) {
   ICHECK(is_zero(op->min));
