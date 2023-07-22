@@ -391,11 +391,14 @@ void CodeGenAArch64::VisitStmt_(const ForNode* op) {
   ICHECK(is_zero(op->min));
   analyzer_->Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
   if (op->is_vla) {
-    CreateSVEFor(MakeValue(op->min), MakeValue(op->extent),
-                 llvm::ConstantInt::getSigned(GetLLVMType(op->extent), 1), op->loop_var, op->body,
+    CreateSVEFor(MakeValue(op->min), 
+                 MakeValue(op->extent),
+                 llvm::ConstantInt::getSigned(GetLLVMType(op->extent), 1), 
+                 op->loop_var, 
+                 op->body,
                  op->stride);
   } else {
-    CodeGenCPU::VisitStmt_(op);
+    CodeGenARM::VisitStmt_(op);
   }
 }
 
