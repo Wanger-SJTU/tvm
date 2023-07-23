@@ -667,6 +667,7 @@ class BufferLoadNode : public PrimExprNode {
   friend class CustomDatatypesLowerer;
   friend class VectorTypeRewriter;
   friend class Vectorizer;
+  friend class VectorizerVLA;
 };
 
 /*!

@@ -132,8 +132,7 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
   }
 
   PrimExpr VisitExpr_(const RampNode* op) final {
-    
-    // This happens when the data tensor is a vector type. 
+    // This happens when the data tensor is a vector type.
     // We scalarize in this case
     need_scalarize_ = true;
     return GetRef<PrimExpr>(op);
@@ -252,19 +251,32 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
     }
   }
   // Load
-  // PrimExpr VisitExpr_(const BufferLoadNode* op) final {
-  //   DataType base_type = op->dtype;
-  //   auto load_type = DataType(base_type.code(), base_type.bits(), type_.lanes(), true);
-  //   PrimExpr index = this->VisitExpr(op->index);
-  //   PrimExpr pred = this->VisitExpr(op->predicate);
-  //   if (index.same_as(op->index) && pred.same_as(op->predicate)) {
-  //     return GetRef<PrimExpr>(op);
-  //   } else {
-  //     // int lanes = std::max(index.dtype().lanes(), pred.dtype().lanes());
-  //     return Load(load_type, op->buffer_var, BroadcastToVL(index, type_.lanes()),
-  //                 BroadcastToVL(pred, type_.lanes()));
-  //   }
-  // }
+  PrimExpr VisitExpr_(const BufferLoadNode* op) final {
+    // DataType base_type = op->dtype;
+    // auto load_type = DataType(base_type.code(), base_type.bits(), type_.lanes(), true);
+    // PrimExpr index = this->VisitExpr(op->index);
+    // PrimExpr pred = this->VisitExpr(op->predicate);
+    // if (index.same_as(op->index) && pred.same_as(op->predicate)) {
+    //   return GetRef<PrimExpr>(op);
+    // } else {
+    //   // int lanes = std::max(index.dtype().lanes(), pred.dtype().lanes());
+    //   return Load(load_type, op->buffer_var, BroadcastToVL(index, type_.lanes()),
+    //               BroadcastToVL(pred, type_.lanes()));
+    // }
+
+    auto load = GetRef<BufferLoad>(op);
+
+    auto fmutate = [this](const PrimExpr& index) { return this->VisitExpr(index); };
+    Array<PrimExpr> indices = op->indices.Map(fmutate);
+
+    if (!indices.same_as(op->indices)) {
+      auto writer = load.CopyOnWrite();
+      writer->indices = indices;
+      writer->LegalizeDType();
+    }
+
+    return std::move(load);
+  }
   // Let
   PrimExpr VisitExpr_(const LetNode* op) final {
     PrimExpr value = this->VisitExpr(op->value);
@@ -298,7 +310,8 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
   //   // type_ = op->buffer_var->dtype.with_scalable_lanes();
   //   DataType base_type = op->value.dtype();
   //   type_ =
-  //       DataType(base_type.code(), base_type.bits(), min_vector_len_bits_ / base_type.bits(), true);
+  //       DataType(base_type.code(), base_type.bits(), min_vector_len_bits_ / base_type.bits(),
+  //       true);
 
   //   PrimExpr value = this->VisitExpr(op->value);
   //   //    type_ = value.dtype().with_scalable_lanes();
@@ -310,21 +323,65 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
   //   } else {
   //     int min_lanes = type_.lanes();
   //     auto vla_loop_body = Store(op->buffer_var, BroadcastToVL(value, min_lanes),
-  //                                BroadcastToVL(index, min_lanes), BroadcastToVL(pred, min_lanes));
+  //                                BroadcastToVL(index, min_lanes), BroadcastToVL(pred,
+  //                                min_lanes));
   //     if (need_loop_) {
   //       need_loop_ = false;
-  //       return For(var_, min_, var_lanes_, ForKind::kSerial, vla_loop_body, NullOpt, 
+  //       return For(var_, min_, var_lanes_, ForKind::kSerial, vla_loop_body, NullOpt,
   //                  Map<String, ObjectRef>(), Span(), true, type_.lanes());
 
-  //             // TVM_DLL For(Var loop_var, PrimExpr min, PrimExpr extent, ForKind kind, Stmt body,
+  //             // TVM_DLL For(Var loop_var, PrimExpr min, PrimExpr extent, ForKind kind, Stmt
+  //             body,
   //             // Optional<IterVar> thread_binding = NullOpt,
-  //             // Map<String, ObjectRef> annotations = Map<String, ObjectRef>(), Span span = Span(), 
+  //             // Map<String, ObjectRef> annotations = Map<String, ObjectRef>(), Span span =
+  //             Span(),
   //             // bool is_vla = false, int stride = 1);
   //     } else {
   //       return vla_loop_body;
   //     }
   //   }
   // }
+// BufferStore
+  Stmt VisitStmt_(const BufferStoreNode* op) final {
+    auto store = GetRef<BufferStore>(op);
+
+    auto fmutate = [this](const PrimExpr& index) { return this->VisitExpr(index); };
+    Array<PrimExpr> indices = op->indices.Map(fmutate);
+
+    PrimExpr value = this->VisitExpr(op->value);
+
+    if (!indices.same_as(op->indices) || !value.same_as(op->value)) {
+      // How many lanes of indexing are present in the index and
+      // buffer element type, excluding the last index.  T
+      int other_index_lanes = op->buffer->dtype.lanes();
+      for (size_t i = 0; i < indices.size() - 1; i++) {
+        other_index_lanes *= indices[i].dtype().lanes();
+      }
+
+      // The total number of lanes of indexing, including the last index.
+      int index_lanes = other_index_lanes * indices[indices.size() - 1].dtype().lanes();
+
+      // The total number of lanes in this store operation.  Either
+      // the index or the value will be broadcast out to this number
+      // of lanes, depending on which has more lanes.
+      int total_lanes = std::max(index_lanes, value.dtype().lanes());
+
+      ICHECK_EQ(total_lanes % other_index_lanes, 0)
+          << "When storing to buffer " << op->buffer->name << ", cannot produce " << total_lanes
+          << " lanes of storage location by changing the last index.";
+      int last_index_lanes = total_lanes / other_index_lanes;
+
+      // Broadcast the last index such that the total number of index
+      // lanes matches the desired number.
+      indices.Set(indices.size() - 1, BroadcastToVL(indices[indices.size() - 1], last_index_lanes));
+
+      auto writer = store.CopyOnWrite();
+      writer->indices = indices;
+      writer->value = BroadcastToVL(value, total_lanes);
+    }
+
+    return std::move(store);
+  }
   // For
   Stmt VisitStmt_(const ForNode* op) final {
     // TODO(giuseros): Add a configuration parameter to enable
@@ -365,7 +422,7 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
       let_binding_[op->var] = new_var;
       need_loop_ = false;
       auto let_stmt = LetStmt(new_var, value, this->VisitStmt(op->body));
-      return For(var_, min_, var_lanes_, ForKind::kSerial, let_stmt, NullOpt, 
+      return For(var_, min_, var_lanes_, ForKind::kSerial, let_stmt, NullOpt,
                  Map<String, ObjectRef>(), Span(), true, type_.lanes());
     } else {
       let_binding_[op->var] = op->var;
