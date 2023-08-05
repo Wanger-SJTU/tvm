@@ -163,6 +163,7 @@ class DataType {
       return *this;
     }
     data_ = rhs.data_;
+    is_scalable_ = rhs.is_scalable_;
     return *this;
   }
   /*!
@@ -172,7 +173,7 @@ class DataType {
    */
   bool operator==(const DataType& other) const {
     return data_.code == other.data_.code && data_.bits == other.data_.bits &&
-           data_.lanes == other.data_.lanes;  // && is_scalable_ == other.is_scalable_;
+           data_.lanes == other.data_.lanes;// && is_scalable_ == other.is_scalable_;
   }
   /*!
    * \brief NotEqual comparator.
