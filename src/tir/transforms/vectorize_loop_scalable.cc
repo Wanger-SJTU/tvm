@@ -39,11 +39,16 @@ namespace tvm {
 namespace tir {
 
 inline PrimExpr BroadcastToVL(PrimExpr e, int min_num_lanes) {
-  if (e.dtype().is_scalable()) return e;
-  // In the VLA world a ramp is always scalable
-  if (e.as<RampNode>()) {
+  
+  if (e.dtype().is_scalable() || e.as<RampNode>()) {
+    
     return e;
   }
+  // In the VLA world a ramp is always scalable
+  // if (e.as<RampNode>()) {
+  //   
+  //   return e;
+  // }
   if (const BroadcastNode* op = e.as<BroadcastNode>()) {
     return Broadcast(op->value, min_num_lanes, true);
   }
@@ -77,7 +82,9 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
   PrimExpr VisitExpr(const PrimExpr& e) final { return ExprFunctor::VisitExpr(e); }
 
   PrimExpr VisitExpr_(const AddNode* op) final {
-    return AddSubVec(op, [](PrimExpr a, PrimExpr b) { return a + b; });
+    auto res = AddSubVec(op, [](PrimExpr a, PrimExpr b) { return a + b; });
+    
+    return res;
   }
 
   PrimExpr VisitExpr_(const SubNode* op) final {
@@ -183,6 +190,7 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
     Var var = GetRef<Var>(op);
 
     if (var.same_as(var_)) {
+      
       return Ramp(var_, 1, type_.lanes(), true);
     }
     auto it = let_binding_.find(var);
@@ -265,16 +273,17 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
     // }
 
     auto load = GetRef<BufferLoad>(op);
+    
 
     auto fmutate = [this](const PrimExpr& index) { return this->VisitExpr(index); };
     Array<PrimExpr> indices = op->indices.Map(fmutate);
-
+    
     if (!indices.same_as(op->indices)) {
       auto writer = load.CopyOnWrite();
       writer->indices = indices;
       writer->LegalizeDType();
     }
-
+    
     return std::move(load);
   }
   // Let
@@ -341,15 +350,17 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
   //     }
   //   }
   // }
-// BufferStore
+  // BufferStore
   Stmt VisitStmt_(const BufferStoreNode* op) final {
     auto store = GetRef<BufferStore>(op);
-
+    type_ = op->buffer->dtype.with_scalable_lanes();
+    
     auto fmutate = [this](const PrimExpr& index) { return this->VisitExpr(index); };
     Array<PrimExpr> indices = op->indices.Map(fmutate);
 
     PrimExpr value = this->VisitExpr(op->value);
-
+    
+    
     if (!indices.same_as(op->indices) || !value.same_as(op->value)) {
       // How many lanes of indexing are present in the index and
       // buffer element type, excluding the last index.  T
@@ -539,8 +550,12 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
   }
   template <typename T, typename FCompute>
   PrimExpr AddSubVec(const T* op, FCompute fcompute) {
+    
     PrimExpr a = this->VisitExpr(op->a);
+    
+    
     PrimExpr b = this->VisitExpr(op->b);
+    
     if (a.same_as(op->a) && b.same_as(op->b)) {
       return GetRef<PrimExpr>(op);
     } else {
@@ -550,19 +565,21 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
         const RampNode* a_ramp = a.as<RampNode>();
         if (a.dtype().lanes() == 1 && b_ramp) {
           PrimExpr new_stride = fcompute(make_zero(b_ramp->stride.dtype()), b_ramp->stride);
-
           if (analyzer_.CanProve(new_stride != 1)) {
             // TODO(giuros01): add support for gather also when stride != 1
             need_scalarize_ = true;
             return GetRef<PrimExpr>(op);
           }
-
+          
           return Ramp(fcompute(a, b_ramp->base), new_stride, b_ramp->lanes, true);
         }
         if (b.dtype().lanes() == 1 && a_ramp) {
           return Ramp(fcompute(a_ramp->base, b), a_ramp->stride, a_ramp->lanes, true);
         }
       }
+      
+      
+      ICHECK_EQ(a.dtype().lanes(), b.dtype().lanes());
       return fcompute(BroadcastToVL(a, type_.lanes()), BroadcastToVL(b, type_.lanes()));
     }
   }
@@ -610,6 +627,7 @@ Pass VectorizeLoopScalable(bool enable_vectorize) {
   auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
     auto* n = f.CopyOnWrite();
     if (enable_vectorize) {
+      
       n->body = LoopVectorizerVLA()(std::move(n->body));
     } else {
       n->body = VectorizeVLASkipper()(std::move(n->body));

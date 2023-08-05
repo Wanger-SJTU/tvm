@@ -456,6 +456,11 @@ Ramp::Ramp(PrimExpr base, PrimExpr stride, int lanes, bool is_scalable, Span spa
   node->stride = stride;
   node->span = std::move(span);
   node->is_scalable = is_scalable;  // is_scalable means xVL
+  
+  if (is_scalable) {
+    node->dtype = node->dtype.with_scalable_lanes();
+  }
+  
   node->lanes = lanes;
   data_ = std::move(node);
 }
@@ -484,6 +489,7 @@ Broadcast::Broadcast(PrimExpr value, int lanes, Span span) {
 // VLA Broadcast
 Broadcast::Broadcast(PrimExpr value, int lanes, bool is_scalable, Span span) {
   ICHECK(value.defined());
+  
   ICHECK(value.dtype().is_scalar());
   ICHECK_GT(lanes, 1);
 
@@ -747,6 +753,9 @@ void BufferLoadNode::LegalizeDType() {
   int buffer_lanes = buffer->dtype.lanes();
 
   this->dtype = buffer->dtype.with_lanes(index_lanes * buffer_lanes);
+  
+  if (indices[indices.size()-1].dtype().is_scalable())
+    this->dtype = this->dtype.with_scalable_lanes();
 }
 
 BufferLoad::BufferLoad(Buffer buffer, Array<PrimExpr> indices, Span span) {

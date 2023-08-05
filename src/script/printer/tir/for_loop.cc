@@ -91,6 +91,8 @@ TVM_STATIC_IR_FUNCTOR(IRDocsifier, vtable)
         prefix = TIR(d, "unroll");
       } else if (loop->kind == tir::ForKind::kVectorized) {
         prefix = TIR(d, "vectorized");
+      } else if (loop->kind == tir::ForKind::kVectorizedScalable) {
+        prefix = TIR(d, "vectorized_scalable");
       } else if (loop->kind == tir::ForKind::kThreadBinding) {
         prefix = TIR(d, "thread_binding");
         thread = LiteralDoc::Str(loop->thread_binding.value()->thread_tag,
