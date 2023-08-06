@@ -65,7 +65,8 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
 
   VectorizerVLA(Var var, PrimExpr min, int var_lanes)
       : var_(var), min_(min), var_lanes_(var_lanes) {
-    // ramp_ = Ramp(var_, 1);
+    ramp_ = Ramp(IntImm(var->dtype, 0), IntImm(var->dtype, 1), var_lanes, 
+                  /*is_scalable = */ true);
   }
 
   Stmt VisitStmt(const Stmt& stmt) final {
@@ -190,8 +191,7 @@ class VectorizerVLA : public StmtMutator, public ExprFunctor<PrimExpr(const Prim
     Var var = GetRef<Var>(op);
 
     if (var.same_as(var_)) {
-      
-      return Ramp(var_, 1, type_.lanes(), true);
+      return ramp_;
     }
     auto it = let_binding_.find(var);
     if (it != let_binding_.end()) {
