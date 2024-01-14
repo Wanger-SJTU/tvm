@@ -2528,7 +2528,11 @@ class Unsqueeze(OnnxOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attr, params):
-        return cls.run_calculation(inputs[0], attr["axes"])
+        axis = attr.get("axes", None)
+        if axis is None:
+            assert len(inputs) == 2, "axes not in attr, should in inputs[1]"
+            axis = inputs[1].data.numpy().tolist()
+        return cls.run_calculation(inputs[0], axis)
 
     @classmethod
     def _impl_v13(cls, inputs, attr, params):
@@ -2563,6 +2567,9 @@ class Squeeze(OnnxOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attr, params):
         axis = attr.get("axes", None)
+        if axis is None:
+            assert len(inputs) == 2, "axes not in attr, should in inputs[1]"
+            axis = inputs[1].data.numpy().tolist()
         return _op.squeeze(inputs[0], axis)
 
     @classmethod

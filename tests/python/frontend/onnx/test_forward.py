@@ -626,20 +626,31 @@ def test_squeeze(target, dev):
     """test_squeeze"""
 
     def test_squeeze_once(in_shape, out_shape, axes=None):
-        y = helper.make_node("Squeeze", ["in"], ["out"], axes=axes)
-
+        y = helper.make_node("Squeeze", 
+                            ["in_" + str(i) for i in range(len(in_shape)) ], 
+                            ["out"], 
+                            axes=axes)
+        if axes is None and len(in_shape) == 2:
+            in_0 = helper.make_tensor_value_info("in_0", TensorProto.FLOAT, list(in_shape[0]))
+            in_1 = helper.make_tensor_value_info("in_1", TensorProto.INT32, list(in_shape[1]))
+            inputs = [in_0, in_1]
+        else:
+            in_0 = helper.make_tensor_value_info("in_0", TensorProto.FLOAT, list(in_shape))
+            inputs = [in_0]
+            
         graph = helper.make_graph(
             [y],
             "squeeze_test",
-            inputs=[helper.make_tensor_value_info("in", TensorProto.FLOAT, list(in_shape))],
+            inputs=[inputs],
             outputs=[helper.make_tensor_value_info("out", TensorProto.FLOAT, list(out_shape))],
         )
 
         model = helper.make_model(graph, producer_name="squeeze_test")
-        x = np.random.uniform(size=in_shape).astype("float32")
-        verify_with_ort_with_inputs(model, [x], [out_shape], target=target, dev=dev, opset=11)
+        in_x = [np.random.uniform(size=shape).astype("float32") for shape in in_shape]
+        verify_with_ort_with_inputs(model, in_x, [out_shape], target=target, dev=dev, opset=11)
 
     test_squeeze_once((1, 3, 1, 3, 1, 1), (3, 3), [0, 2, 4, 5])
+    test_squeeze_once([(1, 3, 1, 3, 1, 1), [0, 2, 4, 5]], (3, 3))
     test_squeeze_once((1, 3, 1, 3, 1, 1), (3, 3))  # empty axis.
     test_squeeze_once((), ())  # scalar testing.
 
@@ -668,22 +679,34 @@ def test_flatten(target, dev):
 @tvm.testing.parametrize_targets
 def test_unsqueeze(target, dev):
     """test_unsqueeze"""
-    in_shape = (3, 3)
-    axis = (0, 3, 4)
-    out_shape = (1, 3, 3, 1, 1)
-    y = helper.make_node("Unsqueeze", ["in"], ["out"], axes=list(axis))
 
-    graph = helper.make_graph(
-        [y],
-        "squeeze_test",
-        inputs=[helper.make_tensor_value_info("in", TensorProto.FLOAT, list(in_shape))],
-        outputs=[helper.make_tensor_value_info("out", TensorProto.FLOAT, list(out_shape))],
-    )
+    def test_unsqueeze_once(in_shape, out_shape, axes=None):
+        y = helper.make_node("Unsqueeze", 
+                            ["in_" + str(i) for i in range(len(in_shape)) ], 
+                            ["out"], 
+                            axes=axes)
+        if axes is None and len(in_shape) == 2:
+            in_0 = helper.make_tensor_value_info("in_0", TensorProto.FLOAT, list(in_shape[0]))
+            in_1 = helper.make_tensor_value_info("in_1", TensorProto.INT32, list(in_shape[1]))
+            inputs = [in_0, in_1]
+        else:
+            in_0 = helper.make_tensor_value_info("in_0", TensorProto.FLOAT, list(in_shape))
+            inputs = [in_0]
+            
+        graph = helper.make_graph(
+            [y],
+            "squeeze_test",
+            inputs=[inputs],
+            outputs=[helper.make_tensor_value_info("out", TensorProto.FLOAT, list(out_shape))],
+        )
 
-    model = helper.make_model(graph, producer_name="squeeze_test")
-    verify_with_ort(model, [in_shape], target=target, dev=dev, opset=11)
+        model = helper.make_model(graph, producer_name="squeeze_test")
+        in_x = [np.random.uniform(size=shape).astype("float32") for shape in in_shape]
+        verify_with_ort_with_inputs(model, in_x, [out_shape], target=target, dev=dev, opset=11)
 
-
+    test_unsqueeze_once((3, 3), (1, 3, 3, 1, 1), (0, 3, 4))
+    test_unsqueeze_once([(3, 3), (0, 3, 4)], (1, 3, 1, 3, 1, 1))
+    
 @tvm.testing.parametrize_targets
 def test_unsqueeze_with_neg_axes(target, dev):
     def verify_unsqueeze_with_neg_axes(opset=11):
